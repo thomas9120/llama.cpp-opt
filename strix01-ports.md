@@ -30,10 +30,26 @@ Fork reference: halo-box/strix-llama.cpp (child of halo-box/llama.cpp).
 - `test-backend-ops -o MUL_MAT`: 1891/1891 PASS (PR38)
 - `test-backend-ops -o MUL_MAT_ID`: 931/931 PASS
 - `test-backend-ops -o FLASH_ATTN_EXT`: 3991/3991 PASS (PR55)
-- Full-model baseline (with all 3 ports), 2026-10-05, `llama-bench -ngl 99 -fa on -p 128 -n 32 -r 1`
-  on `Qwen3.8-Flash-Next-UD-IQ4_XS` (87.24 GiB, 176.94 B params, ROCm gfx1151):
-  pp128 = 211.72 t/s, tg32 = 20.21 t/s. Model is IQ4_XS (no Q6_K tensors, so PR38
-  inactive here); run validates PR55 (FA256 on MMA path, no abort) and PR100 (graphs replay).
+- Full-model longer bench (with all 3 HIP ports), 2026-10-05,
+  `llama-bench -ngl 99 -fa on -p 512,1024,2048 -n 128 -r 3` on UD-IQ4_XS:
+  pp512 = 284.55 ± 28.26, pp1024 = 394.17 ± 20.67, pp2048 = 517.87 ± 21.66,
+  tg128 = 19.72 ± 1.45 t/s. High run-to-run variance (first-run/clocks); default
+  `-b 2048 -ub 512` (upstream recipe used `-b 4096 -ub 4096`).
+
+## Tier 1 rest: Vulkan
+
+- #129 small-M swapped mat-vec: PORTED 2026-10-05 as adaptation with tag `STRIX01-PR129`
+  (fork changed `ggml_vk_mul_mat_vec_q_f16_cols`, a chunking variant absent locally; the
+  transpose_d machinery + `dst->ne[0] <= mul_mat_vec_max_cols` dispatch gate were ported onto
+  local `ggml_vk_mul_mat_vec_q_f16`). New small-m `test_mul_mat` cases added to
+  `tests/test-backend-ops.cpp`. Validation 2026-10-05: separate `build-strix01-vk`
+  (`-DGGML_VULKAN=ON`, SDK 1.4.350.0, `RC` env needed for nested shader-gen configure),
+  `test-backend-ops -b Vulkan0 -o MUL_MAT` 1717/1717 PASS incl. new m=2..9 cases and the
+  m=4,k=10240 HC-inject shape.
+- #27 mat-vec chunk gating: SKIPPED, no local target. It gates fork-only chunking
+  (`ggml_vk_mmv_good_cols`, from fork #1) that neither this tree nor upstream has
+  (no `mmv_good_cols` anywhere; upstream `2cdae802e` not present either). Nothing to port;
+  revisit only if chunking ever lands here.
 - Draft-file crash note: `mainline-mtp-Qwen3.8-Flash-Next-Q4_0.gguf` is an MTP **draft** GGUF
   (34 tensors, all `blk.48.*`), not a standalone model -- running it as `-m` segfaults
   (`0xC0000005`) in `ggml_mul` during graph build. Correct usage is `--model-draft` alongside
