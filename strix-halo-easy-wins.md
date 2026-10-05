@@ -9,7 +9,7 @@ Upstream base here: `thomas9120/llama.cpp-opt` + `ggml-org/llama.cpp` sync, no f
 Local gap (verified 2026-10-05): `ggml/src/ggml-cuda/` has no `mmb.*`, `qsa-*`,
 `idx-relu-sum.*`, `hyperconn.*`. The big Flash-Next gains need those files first.
 
-## Tier 1: portable cherry-picks
+## Tier 1: portable cherry-picks - Complete
 
 ### 1. Q6_K MMQ threshold 256 -> 1024 on RDNA3.5
 - PR: https://github.com/halo-box/strix-llama.cpp/pull/38 (MERGED, +5/-0)
@@ -66,8 +66,6 @@ Local gap (verified 2026-10-05): `ggml/src/ggml-cuda/` has no `mmb.*`, `qsa-*`,
 - #131 MMB gate 512->32 rows for qwen4exp: -9-13% TTFT 256/512 prompts, +53/-16,
   but needs MMB base (#63/#18) and is not math-preserving.
   https://github.com/halo-box/strix-llama.cpp/pull/131
-- #40 Q4_0_ROCMFP4_FAST MMQ tiles (+469): only if shipping FP4 GGUFs, else HIP uses
-  dequant + hipBLAS fallback. Isolated, zero change for other types.
   https://github.com/halo-box/strix-llama.cpp/pull/40
 - #106 OPEN decode (+1635): +19.6% tg 24.28->29.05 t/s byte-exact, 10 commits stacked
   on #91. Idea to steal alone: GDN decode-chain fusion (+5.6%).

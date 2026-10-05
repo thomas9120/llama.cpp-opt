@@ -1,5 +1,5 @@
 # Build strix01 for Strix Halo (gfx1151) with HIP/ROCm.
-# Run from the repo root:  powershell -ExecutionPolicy Bypass -File .\build-hip-strix01.ps1
+# Run from the repo root:  powershell -ExecutionPolicy Bypass -File .\strix01-build-hip.ps1
 # Binaries land in build-strix01\bin\ (llama-server.exe, llama-cli.exe, llama-fit-params.exe, llama-bench.exe, test-backend-ops.exe).
 param(
     [string]$BuildDir = "build-strix01",
@@ -28,6 +28,11 @@ cmake -S . -B $BuildDir -G Ninja `
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
     -DCMAKE_RC_COMPILER="$env:RC" `
     -DCMAKE_BUILD_TYPE=$Config
+
+# Fail fast if CMAKE_BUILD_TYPE did not expand (e.g. lines pasted into cmd.exe where $Config stays literal)
+$CachedType = Select-String -Path (Join-Path $BuildDir 'CMakeCache.txt') -Pattern '^CMAKE_BUILD_TYPE:STRING=(.+)$' |
+    ForEach-Object { $_.Matches.Groups[1].Value }
+if ($CachedType -ne $Config) { throw "CMAKE_BUILD_TYPE mismatch: cache has '$CachedType', expected '$Config'. Run this script from PowerShell, not cmd.exe." }
 
 cmake --build $BuildDir --config $Config `
     --target test-backend-ops llama-bench llama-cli llama-fit-params llama-server -j $Jobs
