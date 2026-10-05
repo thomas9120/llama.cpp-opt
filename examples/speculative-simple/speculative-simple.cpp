@@ -125,12 +125,12 @@ int main(int argc, char ** argv) {
 
     // eval the prompt on the target and feed it to the speculative implementation(s)
     {
-        common_batch batch_prompt(ctx_tgt);
+        llama_batch batch_prompt = llama_batch_init(inp.size(), 0, 1);
         for (size_t i = 0; i < inp.size() - 1; ++i) {
-            batch_prompt.add(inp[i], i, seq_id, false);
+            common_batch_add(batch_prompt, inp[i], i, { seq_id }, false);
         }
 
-        llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_prompt.get());
+        llama_decode(ctx_tgt, batch_prompt);
 
         if (!common_speculative_process(spec, batch_prompt)) {
             LOG_ERR("%s", "failed to process speculative prompt\n");
@@ -149,7 +149,7 @@ int main(int argc, char ** argv) {
 
     common_speculative_begin(spec, seq_id, prompt_tgt);
 
-    common_batch batch_tgt(ctx_tgt);
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
     llama_tokens draft;
 
@@ -219,17 +219,18 @@ int main(int argc, char ** argv) {
         }
 
         // always have a token to evaluate from before - id_last
-        batch_tgt.clear();
-        batch_tgt.add(id_last, n_past++, seq_id, true);
+        common_batch_clear(batch_tgt);
+        common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
         {
             for (size_t i = 0; i < draft.size(); ++i) {
-                batch_tgt.add(draft[i], n_past + i, seq_id, true);
+                common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
             }
 
+            //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-            llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
+            llama_decode(ctx_tgt, batch_tgt);
         }
 
         // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.
@@ -364,6 +365,7 @@ int main(int argc, char ** argv) {
     LOG_INF("target:\n\n");
     common_perf_print(ctx_tgt, smpl.get());
 
+    llama_batch_free(batch_tgt);
 
     common_speculative_free(spec);
 

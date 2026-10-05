@@ -14,11 +14,9 @@ export type {
 	ApiModelLoadStage,
 	ApiModelsSseProgress,
 	ApiModelsSseData,
-	ApiModelsSseDownloadProgressData,
 	ApiModelsSseEvent,
-	ApiModelsDownloadRequest,
-	ApiModelsDownloadResponse,
 	ApiModelDetails,
+	ApiModelListResponse,
 	ApiLlamaCppServerProps,
 	ApiChatCompletionRequest,
 	ApiChatCompletionToolCallFunctionDelta,
@@ -28,28 +26,17 @@ export type {
 	ApiChatCompletionResponse,
 	ApiSlotData,
 	ApiProcessingState,
-	ApiModelsLoadResponse,
-	ApiModelsListResponse,
-	ApiModelsUnloadResponse,
+	ApiRouterModelMeta,
+	ApiRouterModelsLoadRequest,
+	ApiRouterModelsLoadResponse,
+	ApiRouterModelsStatusRequest,
+	ApiRouterModelsStatusResponse,
+	ApiRouterModelsListResponse,
+	ApiRouterModelsUnloadRequest,
+	ApiRouterModelsUnloadResponse,
 	AudioInputFormat,
 	ApiStreamSession
 } from './api';
-
-// HuggingFace types
-export type {
-	HfCatalogBuild,
-	HfCatalogEntry,
-	HfCatalogSize,
-	HfModelApiResponse,
-	HfModelCardData,
-	HfModelDetails,
-	HfModelDetailInfo,
-	HfModelGguf,
-	HfModelInfo,
-	HfModelSearchParams,
-	HfModelSibling,
-	HfModelSiblingRef
-} from './huggingface';
 
 // Chat types
 export type {
@@ -105,8 +92,6 @@ export type {
 	ModelCapabilities,
 	ModelModalities,
 	ModelOption,
-	ModelDownloadFileProgress,
-	ModelDownloadProgress,
 	ModelLoadProgress,
 	ModalityCapabilities
 } from './models';

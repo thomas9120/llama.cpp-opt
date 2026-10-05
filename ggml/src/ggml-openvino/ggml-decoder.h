@@ -28,9 +28,7 @@ struct ModelParams {
     std::map<int, int> n_heads_kv_per_layer;
     int head_size = -1;
     int state_size = -1;  // for SSM molels, eg qwen35
-    int32_t rope_params[16] = {};
-    int n_rs_slots = -1;
-    bool has_rs_rollback = false;
+    int32_t rope_params[16];
     bool mixed_rope_params = false;
     bool is_cacheless_attn = false;
     std::vector<int> swa_layers;
@@ -47,15 +45,9 @@ struct ModelParams {
                memcmp(rope_params, other.rope_params, sizeof(int32_t) * 16) == 0;
     }
 
-    bool can_reuse_dynamically(const ModelParams & other) const {
-        return same_rope_params(other) && n_rs_slots == other.n_rs_slots &&
-               has_rs_rollback == other.has_rs_rollback;
-    }
+    bool can_reuse_dynamically(const ModelParams & other) const { return same_rope_params(other); }
 
-    bool can_reuse_statically(const ModelParams & other) const {
-        return same_rope_params(other) && ctx == other.ctx && n_rs_slots == other.n_rs_slots &&
-               has_rs_rollback == other.has_rs_rollback;
-    }
+    bool can_reuse_statically(const ModelParams & other) const { return same_rope_params(other) && ctx == other.ctx; }
 
     bool kv_buffer_changed(const ModelParams & other) const { return kv_buffer_ctx_id != other.kv_buffer_ctx_id; }
 };
@@ -108,7 +100,7 @@ struct ComputeParams {
 
     struct RsWriteback {
         int slot_begin = 0;  // first cache slot written by the CPY
-        int src_begin = -1;  // first source column copied by a conv-state CPY
+        int src_begin = 0;   // first source row or column copied by the CPY
     };
 
     std::map<std::string, RsWriteback> rs_writebacks;
@@ -361,7 +353,6 @@ public:
     void add_extra_inputs();
 
     void update_io(ggml_cgraph * cgraph);
-    bool is_bound_to(const ggml_cgraph * cgraph) const;
 
     static bool is_inp_tok(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_GET_ROWS && tensor == op->src[1] && op->src[0]->op == GGML_OP_NONE;
@@ -371,11 +362,10 @@ public:
         return op->op == GGML_OP_ROPE && tensor == op->src[1];
     }
 
-    // IMROPE and VISION pack 4 stacked position planes (t/h/w/e) into inp_pos, each of length
+    // IMROPE packs 4 stacked position planes (t/h/w/e) into inp_pos, each of length
     // n_tokens; other modes carry a single position per token.
     static int get_inp_pos_n_planes(const ggml_tensor * op) {
-        const int mode = op->op_params[2];
-        return (mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION || (mode & GGML_ROPE_TYPE_MROPE)) ? 4 : 1;
+        return op->op_params[2] == GGML_ROPE_TYPE_IMROPE ? 4 : 1;
     }
 
     static bool is_inp_emb(const ggml_tensor * tensor, const ggml_tensor * op) {
@@ -397,26 +387,17 @@ public:
         return op->op == GGML_OP_ROPE && tensor == op->src[2];
     }
 
-    inline static bool is_recurrent_cache(const ggml_tensor * tensor) {
-        return tensor != nullptr && (strncmp(tensor->name, "cache_r_l", strlen("cache_r_l")) == 0 ||
-                                     strncmp(tensor->name, "cache_s_l", strlen("cache_s_l")) == 0 ||
-                                     strncmp(tensor->name, "cache_ple_r_l", strlen("cache_ple_r_l")) == 0);
-    }
-
-    inline static bool is_cache(const ggml_tensor * tensor, const ggml_tensor * op) {
-        return is_recurrent_cache(tensor) || is_kvcache(tensor, op);
-    }
-
-    inline static bool is_kvcache(const ggml_tensor * tensor, const ggml_tensor * op) {
-        if (tensor == nullptr || is_recurrent_cache(tensor)) {
+    // also returns true for cache_s and cache_r in SSM/DeltaNet models
+    static bool is_kvcache(const ggml_tensor * tensor, const ggml_tensor * op) {
+        if (tensor == nullptr) {
             return false;
         }
         return (tensor->buffer != nullptr && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY) ||
                (op != nullptr && op->op == GGML_OP_SET_ROWS && op->src[2] == tensor);
     }
 
-    inline static bool is_conv_state_writeback(const ggml_tensor * node) {
-        return node->op == GGML_OP_CPY && node->view_src != nullptr && is_recurrent_cache(node->view_src) &&
+    static bool is_conv_state_writeback(const ggml_tensor * node) {
+        return node->op == GGML_OP_CPY && node->view_src != nullptr && is_kvcache(node->view_src, nullptr) &&
                node->src[0] != nullptr && node->src[0]->op == GGML_OP_VIEW && node->src[0]->src[0] != nullptr &&
                node->src[0]->src[0]->op == GGML_OP_CONCAT && node->src[1] != nullptr &&
                node->src[1]->op == GGML_OP_VIEW && node->src[1]->view_src == node->view_src;

@@ -116,20 +116,6 @@ This provides BLAS acceleration using only the CPU. Make sure to have OpenBLAS i
 
 Check [BLIS.md](./backend/BLIS.md) for more information.
 
-### AMD AOCL-BLAS
-
-For AMD CPU inference, the [ZenDNN backend](#zendnn) is recommended. AOCL-BLAS is also available as a vendor option for the generic `GGML_BLAS` backend.
-
-Source `amd-libs.cfg` from your AOCL install (MT tree by default), then build (CMake 3.27+ recommended for the `AOCL` / `AOCL_mt` vendors):
-
-```bash
-source /opt/aocl/<version>/aocc/MT/amd-libs.cfg   # adjust path; ST tree uses .../ST/amd-libs.cfg
-cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=AOCL_mt -DBLAS_INCLUDE_DIRS="${AOCL_ROOT}/include" -DGGML_NATIVE=ON
-cmake --build build --config Release
-```
-
-Full steps, threading notes, and a fallback for older CMake: [AOCL.md](./backend/AOCL.md).
-
 ### Intel oneMKL
 
 Building through oneAPI compilers will make avx_vnni instruction set available for intel processors that do not support avx512 and avx512_vnni. Please note that this build config **does not support Intel GPU**. For Intel GPU support, please refer to [llama.cpp for SYCL](./backend/SYCL.md).
@@ -194,16 +180,6 @@ Make sure to read the notes about the CPU build for general instructions for e.g
 cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release
 ```
-
-To use a specific CCCL version instead of the one bundled with the installed CUDA Toolkit, add `-DGGML_CUDA_CCCL_VERSION=vMAJOR.MINOR.PATCH`. CUB DeviceTopK requires CCCL 3.4.3 or newer; older versions use the sort fallback.
-
-Note that this also builds the CPU backend by default. On Windows on ARM, MSVC's
-support for the ARM NEON intrinsics used by the CPU backend may be incomplete, so
-a CUDA build produced entirely with MSVC might have a slower CPU backend. If CPU
-performance matters, try following the split build used in our release workflow
-([.github/workflows/release.yml](../.github/workflows/release.yml)): the CPU backend
-is built with clang (`cmake/arm64-windows-llvm.cmake`) and the CUDA backend with MSVC
-(`cmake/arm64-windows-msvc-cuda.cmake`), and the artifacts are merged afterwards.
 
 ### Non-Native Builds
 
@@ -306,13 +282,6 @@ Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command
 Override default, speed-optimized compute types for cuBLAS matrix multiplications.
 Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
-#### GGML_CUDA_MMQ_PREC
-
-Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications.
-Currently supported values: `auto`, `q8`, `q4`.
-
-NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
-
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
@@ -354,11 +323,11 @@ cmake --build build --config Release
 By default, all supported compute capabilities are enabled. To customize this behavior, you can specify the `MUSA_ARCHITECTURES` option in the CMake command:
 
 ```bash
-cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="31"
+cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="21"
 cmake --build build --config Release
 ```
 
-This configuration enables only compute capability `3.1` (MTT S5000) during compilation, which can help reduce compilation time.
+This configuration enables only compute capability `2.1` (MTT S80) during compilation, which can help reduce compilation time.
 
 #### Compilation options
 
@@ -431,9 +400,74 @@ If your GPU is not officially supported you can use the environment variable [`H
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
 
+### Windows Strix Halo with TheRock ROCm 10
+
+From a regular PowerShell, run `.\build-windows.ps1` in the repository root. It selects Visual Studio 2022, configures the SDK paths, builds `llama-server`, `llama-cli`, `llama-bench`, `llama-fit-params`, and `llama-perplexity`, and copies the OpenMP runtime beside the executables. The defaults are `C:\TheRock\build`, `gfx1151`, 12 parallel jobs, and the `build-rocm10-gfx1151` output directory. Use `-RocmPath`, `-BuildDir`, or `-Jobs` to override these settings, or `-ConfigureOnly` to configure without compiling.
+
+For `gfx1151` (Radeon 8060S), use a Visual Studio 2022 Developer PowerShell with the x64 toolchain. TheRock Clang 23 conflicts with the MSVC 14.51 math headers from Visual Studio 2026; MSVC 14.44 from Visual Studio 2022 avoids this build error.
+
+From the repository root, with the ROCm 10 SDK extracted to `C:\TheRock\build`:
+
+```powershell
+$env:HIP_PATH = 'C:\TheRock\build'
+$env:ROCM_PATH = $env:HIP_PATH
+$env:HIP_DEVICE_LIB_PATH = "$env:HIP_PATH\lib\llvm\amdgcn\bitcode"
+$env:PATH = "$env:HIP_PATH\bin;$env:HIP_PATH\lib\llvm\bin;$env:PATH"
+$env:CCACHE_DIR = "$PWD\build-rocm10-gfx1151\ccache"
+cmake -S . -B build-rocm10-gfx1151 -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    "-DCMAKE_C_COMPILER=$env:HIP_PATH/lib/llvm/bin/clang.exe" `
+    "-DCMAKE_CXX_COMPILER=$env:HIP_PATH/lib/llvm/bin/clang++.exe" `
+    "-DCMAKE_PREFIX_PATH=$env:HIP_PATH" -DGGML_HIP=ON -DGPU_TARGETS=gfx1151
+cmake --build build-rocm10-gfx1151 --target llama-server llama-cli llama-bench llama-fit-params llama-perplexity --parallel 12
+```
+
+Executables are in `build-rocm10-gfx1151\bin`. Keep the SDK's `bin` directory on `PATH` when running them. With OpenMP enabled, the Visual Studio runtime `libomp140.x86_64.dll` must also be on `PATH` or beside the executables. Use a fresh build directory when changing the compiler or Visual Studio toolchain.
+
+This fork disables the three former `LLAMA_MMB_HC16` controls on Windows because of the output corruption reported in [pwilkin/llama.cpp#24](https://github.com/pwilkin/llama.cpp/issues/24). These controls are compiled in; setting that environment variable does not change them. Validate model answers and long-context retrieval before comparing performance.
+
+For Qwen3.8-Flash-Next, `--lazy-mode on-direct` supports Windows through concurrent, buffered file reads for the PLE table, including speculative prefetch. The startup log reports `direct reads enabled` when active; if the file cannot be reopened, it warns and falls back to lazy memory-mapped reads. This mode still uses the Windows file cache. Compare it with `--lazy-mode on` using real prompts; performance depends on storage and available memory.
+
+Windows HIP on RDNA3.5 does not advertise pinned host buffers as directly GPU-compatible. This avoids a reproduced long-context screenshot crash while preserving pinned transfers, but can require extra device buffers. See the [diagnosis and validation limits](development/windows-mtp-buffer-replay.md#direct-pinned-host-execution-failure-2026-09-25).
+
+#### Checking an upstream sync
+
+The Windows regression runner includes `test-alloc`, which forces backend allocation failures and checks repeated failure, successful retry, and shared-buffer cleanup without exhausting system memory.
+
+Run `.\test-windows.ps1` after merging or rebasing upstream, before copying binaries to a launcher. It rebuilds with `build-windows.ps1`, checks that all four tools start, runs synthetic lazy-reader tests, and runs the existing ROCm attention tests against their CPU reference. It requires the same SDK and VS 2022 installation as the build script, a `gfx1151` GPU, and a filesystem supporting sparse files. No model download is needed. `-RocmPath`, `-BuildDir`, and `-Jobs` override the build settings.
+
+The source guards flag changes to the three Windows HC16 workarounds, F16-only sparse attention selection, Windows direct-reader activation and prefetch, and the build target list. These are conservative checks of the current source structure, not proof of correctness: an upstream rewrite may require updating them after review. Do not remove a failing check just to accept a merge.
+
+The reader tests compare F32, F16, Q8_0, Q4_K, IQ4_NL, and IQ4_XS rows against memory-mapped reads, including concurrent gathers and prefetch, repeated indices, Unicode paths, offsets above 4 GiB, empty/single-row requests, and EOF errors. Test sources stay under `scripts/`; generated files and logs stay under `<BuildDir>/windows-regression`. Attention validation fails if either F16 or Q8 cases stop running, even if the backend test executable returns success. The runner temporarily clears the compiler-only `HIP_DEVICE_LIB_PATH` during GPU tests because leaving it set caused HIP initialization failures with the installed SDK/driver combination.
+
+Use `.\test-windows.ps1 -SourceOnly` for a quick check without compiling, or `-SkipGpu` when the GPU is busy. Both provide partial validation. The full suite does not load Qwen or exercise its complete graph: after a sync, also test a representative prompt with `--lazy-mode on-direct`, first with F16 K/V and then Q8 K/V, and confirm `direct reads enabled` in the startup log. Compare output quality and cold/warm prompt speed with the previous working build. Keep that build until the replacement passes these checks.
+
+The suite also injects `std::bad_alloc` into both server slot iteration paths during batch construction, checks that the exception propagates, and verifies that a fresh batch can be built afterward. It also checks per-slot recovery after batch rendering and the allocation diagnostics. These report the operation, checkpoint buffer capacity, Windows system commit/limit, available physical memory, and process private commit/working set only when an allocation fails. Source guards cover discarding the partial batch and clearing aborted prompt caches. This tests recovery without exhausting system memory; it does not prove that a particular model configuration fits.
+
+The QSA metadata test compiles the current production function with lightweight cache adapters. It checks screenshot-induced position gaps, complete blocks beyond the physical cache window, incomplete blocks, permuted cells, and two sequences sharing a cache. Per-cell, per-block, and compact visibility are compared against a logical-position reference. The final attention-mask helper runs on CPU and ROCm with F32 and F16 mask storage. Gapped Q8 caches use per-cell masking; F16 block selection retains explicit tail indices. These checks do not validate the MTP model's image handling or reproduce the full server workload: also test a screenshot conversation with the rebuilt binaries.
+
 ## Vulkan
 
 ### For Windows Users:
+
+**PowerShell build script (Visual Studio 2022)**
+
+Install Visual Studio 2022 with the x64 C++ build tools and CMake/Ninja tools, and the [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows). Open a new PowerShell and run from the repository root:
+
+```powershell
+.\build-windows-vulkan.ps1
+```
+
+The script selects the VS 2022 x64 toolchain and builds `llama-server`, `llama-cli`, `llama-bench`, `llama-fit-params`, and `llama-perplexity` in Release mode. Executables are in `build-vulkan\bin`. It uses `VULKAN_SDK` by default; use `-VulkanSdkPath` to select another SDK, `-BuildDir` to select another output directory, or `-Jobs` to change the default 12 parallel jobs. `-ConfigureOnly` skips compilation. `-Portable` disables native CPU tuning and requests static OpenSSL libraries, matching the ROCm script. Use a fresh build directory when changing toolchains.
+
+```powershell
+.\build-windows-vulkan.ps1 -VulkanSdkPath C:\VulkanSDK\1.4.350.0 -Jobs 8
+.\build-vulkan\bin\llama-cli.exe --list-devices
+```
+
+A Vulkan-capable GPU driver is required to run the binaries.
+
+For stable ZIP releases through GitHub Actions, see [Windows Vulkan releases](windows-vulkan-release.md).
+
 **w64devkit**
 
 Download and extract [`w64devkit`](https://github.com/skeeto/w64devkit/releases).

@@ -51,7 +51,7 @@ int main(int argc, char ** argv){
 
     common_ngram_cache ngram_cache_context;
     common_ngram_cache ngram_cache_dynamic;
-    common_ngram_cache ngram_cache_static;
+    std::shared_ptr<const common_ngram_cache_static> ngram_cache_static;
     int64_t t_draft_flat_us = 0;
     int64_t t_draft_us = 0;
 
@@ -62,7 +62,7 @@ int main(int argc, char ** argv){
 
         if (!params.speculative.ngram_cache.lookup_cache_static.empty()) {
             try {
-                ngram_cache_static = common_ngram_cache_load(params.speculative.ngram_cache.lookup_cache_static);
+                ngram_cache_static = common_ngram_cache_static_load(params.speculative.ngram_cache.lookup_cache_static);
             } catch (std::ifstream::failure const &) {
                 LOG_ERR("failed to open static lookup cache: %s", params.speculative.ngram_cache.lookup_cache_static.c_str());
                 exit(1);
@@ -98,13 +98,8 @@ int main(int argc, char ** argv){
 
     const auto t_enc_start = ggml_time_us();
 
-    {
-        common_batch batch = common_batch_get_one(ctx, inp.data(), n_input - 1);
-        llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-
-        batch = common_batch_get_one(ctx, &inp.back(), 1);
-        llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-    }
+    llama_decode(ctx, llama_batch_get_one( inp.data(), n_input - 1));
+    llama_decode(ctx, llama_batch_get_one(&inp.back(),           1));
 
     const auto t_enc_end = ggml_time_us();
 
@@ -120,7 +115,7 @@ int main(int argc, char ** argv){
 
     std::vector<llama_token> draft;
 
-    common_batch batch_tgt(ctx);
+    llama_batch batch_tgt = llama_batch_init(llama_n_ctx(ctx), 0, 1);
 
     const auto t_dec_start = ggml_time_us();
 
@@ -197,24 +192,24 @@ int main(int argc, char ** argv){
         // clean the cache of draft tokens that weren't accepted
         llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, -1);
 
-        batch_tgt.clear();
-        batch_tgt.add(draft[0], n_past, 0, true);
+        common_batch_clear(batch_tgt);
+        common_batch_add(batch_tgt, draft[0], n_past, { 0 }, true);
 
         // Draft already contains a single token sampled from the model:
         GGML_ASSERT(draft.size() == 1);
         GGML_ASSERT(draft[0] == inp.back());
         const int64_t t_start_draft_us = ggml_time_us();
 
-        common_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
+        common_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static.get());
 
         for (size_t i = 1; i < draft.size(); ++i) {
-            batch_tgt.add(draft[i], n_past + i, 0, true);
+            common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
         }
 
         t_draft_us += ggml_time_us() - t_start_draft_us;
         n_drafted += draft.size() - 1;
 
-        llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
+        llama_decode(ctx, batch_tgt);
         ++n_past;
 
         draft.erase(draft.begin());
@@ -246,6 +241,7 @@ int main(int argc, char ** argv){
 
     common_sampler_free(smpl);
 
+    llama_batch_free(batch_tgt);
 
     llama_backend_free();
 

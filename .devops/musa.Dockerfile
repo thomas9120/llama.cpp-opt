@@ -1,9 +1,10 @@
 ARG UBUNTU_VERSION=22.04
 # This needs to generally match the container host's environment.
+ARG MUSA_VERSION=rc4.3.0
 # Target the MUSA build image
-ARG BASE_MUSA_DEV_CONTAINER=registry.mthreads.com/mcconline/musa_sdk:5.2.0-devel-ubuntu${UBUNTU_VERSION}-s5000
+ARG BASE_MUSA_DEV_CONTAINER=docker.io/mthreads/musa:${MUSA_VERSION}-devel-ubuntu${UBUNTU_VERSION}-amd64
 
-ARG BASE_MUSA_RUN_CONTAINER=registry.mthreads.com/mcconline/musa_sdk:5.2.0-runtime-ubuntu${UBUNTU_VERSION}-s5000
+ARG BASE_MUSA_RUN_CONTAINER=docker.io/mthreads/musa:${MUSA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}-amd64
 
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
@@ -36,10 +37,7 @@ RUN apt-get update && \
     python3-pip \
     git \
     libssl-dev \
-    libgomp1 \
-    musa-mualg-5-2 \
-    musa-muthrust-5-2 \
-    libmthreads-compute
+    libgomp1
 
 WORKDIR /app
 
@@ -82,15 +80,12 @@ LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.source=$IMAGE_SOURCE
 
 RUN apt-get update \
-    && apt-get install -y libgomp1 curl ffmpeg libmthreads-compute \
+    && apt-get install -y libgomp1 curl ffmpeg \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
-
-# The MUSA runtime image does not register its library directory
-RUN echo "/usr/local/musa/lib" > /etc/ld.so.conf.d/musa-runtime.conf && ldconfig
 
 COPY --from=build /app/lib/ /app
 

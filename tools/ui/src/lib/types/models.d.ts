@@ -1,4 +1,3 @@
-import type { ModelSidecar } from '$lib/constants/model-id.constants';
 import type { ApiModelDataEntry, ApiModelDetails, ApiModelLoadStage } from '$lib/types/api';
 
 export interface ModelModalities {
@@ -9,7 +8,6 @@ export interface ModelModalities {
 
 export interface ModelCapabilities {
 	reasoning: boolean;
-	tools: boolean;
 }
 
 export interface ModelOption {
@@ -26,25 +24,15 @@ export interface ModelOption {
 	tags?: string[];
 }
 
-/** UI-only load progress for one model, driven by the /models/sse feed. */
+/**
+ * Ephemeral UI-only load progress for one model instance.
+ * Lives only while a load runs, driven by the /models/sse feed.
+ * stage is absent until the feed reports its first stage.
+ */
 export interface ModelLoadProgress {
 	stages: ApiModelLoadStage[];
 	current: ApiModelLoadStage;
 	value: number;
-}
-
-/** Per-file bytes of an in-flight download. */
-export interface ModelDownloadFileProgress {
-	done: number;
-	total: number;
-}
-
-/** Progress of an in-flight download, summed across its files. */
-export interface ModelDownloadProgress {
-	downloadedBytes: number;
-	totalBytes: number;
-	/** Per-file progress keyed by file URL. */
-	files: Record<string, ModelDownloadFileProgress>;
 }
 
 export interface ParsedModelId {
@@ -54,11 +42,12 @@ export interface ParsedModelId {
 	params: string | null;
 	activatedParams: string | null;
 	quantization: string | null;
-	sidecar: ModelSidecar | null;
 	tags: string[];
 }
 
-/** Modality capabilities for file validation. */
+/**
+ * Modality capabilities for file validation
+ */
 export interface ModalityCapabilities {
 	hasVision: boolean;
 	hasAudio: boolean;

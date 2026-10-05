@@ -19,6 +19,57 @@ struct mm_ids_helper_store {
 };
 static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
 
+// Qwen4exp 512-expert / 10-active fast path. The generic helper launches one warp per expert and every
+// warp scans all token slots (O(n_experts*n_tokens*n_used)). Here one block histograms the slots, computes
+// the 512 bounds, and scatters the two maps in O(n_tokens*n_used). Row ordering inside an expert is irrelevant:
+// ids_dst maps every compact MMQ row back to its exact destination and there is no cross-row reduction.
+__launch_bounds__(1024, 1)
+static __global__ void mm_ids_helper_512_10(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        int32_t * __restrict__ expert_bounds, const int n_tokens, const int nchannels_y,
+        const int si1, const int sis1, const bool write_inverse) {
+    __shared__ int counts[512];
+    __shared__ int cursors[512];
+
+    const int tid = threadIdx.x;
+    if (tid < 512) {
+        counts[tid] = 0;
+        cursors[tid] = 0;
+    }
+    __syncthreads();
+
+    const int n_slots = n_tokens * 10;
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token = idx / 10;
+        const int iex   = idx - token * 10;
+        atomicAdd(&counts[ids[token * si1 + iex]], 1);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int total = 0;
+        expert_bounds[0] = 0;
+        for (int e = 0; e < 512; ++e) {
+            total += counts[e];
+            expert_bounds[e + 1] = total;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token = idx / 10;
+        const int iex   = idx - token * 10;
+        const int expert = ids[token * si1 + iex];
+        const int dst = expert_bounds[expert] + atomicAdd(&cursors[expert], 1);
+        ids_dst[dst] = idx;
+        if (write_inverse) {
+            ids_src1[idx] = dst;
+        } else {
+            ids_src1[dst] = token * sis1 + iex % nchannels_y;
+        }
+    }
+}
+
 // the generic path passes 0, which needs no padding since it never groups lanes by token
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
@@ -36,6 +87,9 @@ static __global__ void mm_ids_helper(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
+
+    // token slots per warp lane group, padded to a power of 2 so a warp divides evenly
+    constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
 
     extern __shared__ char data_mm_ids_helper[];
     mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
@@ -66,7 +120,6 @@ static __global__ void mm_ids_helper(
     } else {
         // Implementation optimized for specific numbers of experts used:
         // a warp holds a whole number of token slots, so the slot count is padded to a power of 2
-        constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
         static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
@@ -150,6 +203,12 @@ static void launch_mm_ids_helper(
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
+        mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
+            ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
+        return;
+    }
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
@@ -176,4 +235,123 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
+}
+
+static constexpr int MM_IDS_ROUTE_TILE = 1024;
+static constexpr int MM_IDS_ROUTE_BITS = 10;
+static constexpr int MM_IDS_ROUTE_EXPERTS = 512;
+static constexpr int MM_IDS_ROUTE_USED = 10;
+
+static __global__ void mm_ids_route_sort(
+        const int32_t * ids, uint32_t * sorted, int32_t * offsets, int32_t * starts,
+        int routes, int chunks, int ids_stride) {
+    __shared__ uint32_t keys[MM_IDS_ROUTE_TILE];
+    __shared__ int first[MM_IDS_ROUTE_EXPERTS];
+    __shared__ int counts[MM_IDS_ROUTE_EXPERTS];
+    const int chunk=blockIdx.x;
+    for (int i=threadIdx.x;i<MM_IDS_ROUTE_EXPERTS;i+=blockDim.x) {
+        first[i]=0;counts[i]=0;
+    }
+    for (int i=threadIdx.x;i<MM_IDS_ROUTE_TILE;i+=blockDim.x) {
+        const int route=chunk*MM_IDS_ROUTE_TILE+i;
+        int expert=-1;
+        if (route<routes) expert=ids[(route/MM_IDS_ROUTE_USED)*ids_stride+route%MM_IDS_ROUTE_USED];
+        keys[i]=expert>=0 && expert<MM_IDS_ROUTE_EXPERTS ?
+            (uint32_t(expert)<<MM_IDS_ROUTE_BITS)|uint32_t(i) : UINT32_MAX;
+    }
+    __syncthreads();
+    for (int span=2;span<=MM_IDS_ROUTE_TILE;span*=2) {
+        for (int distance=span/2;distance>0;distance/=2) {
+            for (int i=threadIdx.x;i<MM_IDS_ROUTE_TILE;i+=blockDim.x) {
+                const int partner=i^distance;
+                if (partner>i) {
+                    const uint32_t a=keys[i],b=keys[partner];
+                    if (((i&span)==0 && a>b) || ((i&span)!=0 && a<b)) {
+                        keys[i]=b;keys[partner]=a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int i=threadIdx.x;i<MM_IDS_ROUTE_TILE;i+=blockDim.x) {
+        if (keys[i]!=UINT32_MAX) {
+            const int expert=keys[i]>>MM_IDS_ROUTE_BITS;
+            if (i==0 || (keys[i-1]>>MM_IDS_ROUTE_BITS)!=uint32_t(expert)) first[expert]=i;
+        }
+        sorted[chunk*MM_IDS_ROUTE_TILE+i]=keys[i];
+    }
+    __syncthreads();
+    for (int i=threadIdx.x;i<MM_IDS_ROUTE_TILE;i+=blockDim.x) {
+        if (keys[i]!=UINT32_MAX) {
+            const int expert=keys[i]>>MM_IDS_ROUTE_BITS;
+            if (i+1==MM_IDS_ROUTE_TILE || (keys[i+1]>>MM_IDS_ROUTE_BITS)!=uint32_t(expert)) {
+                counts[expert]=i+1-first[expert];
+            }
+        }
+    }
+    __syncthreads();
+    for (int i=threadIdx.x;i<MM_IDS_ROUTE_EXPERTS;i+=blockDim.x) {
+        offsets[chunk*MM_IDS_ROUTE_EXPERTS+i]=counts[i];
+        starts[chunk*MM_IDS_ROUTE_EXPERTS+i]=first[i];
+    }
+    (void)chunks;
+}
+
+static __global__ void mm_ids_route_prefix(int32_t * offsets, int32_t * bounds, int chunks) {
+    __shared__ int totals[MM_IDS_ROUTE_EXPERTS];
+    const int expert=threadIdx.x;
+    int total=0;
+    for (int chunk=0;chunk<chunks;++chunk) total+=offsets[chunk*MM_IDS_ROUTE_EXPERTS+expert];
+    totals[expert]=total;
+    __syncthreads();
+    int prefix=0;
+    for (int previous=0;previous<expert;++previous) prefix+=totals[previous];
+    bounds[expert]=prefix;
+    if (expert==MM_IDS_ROUTE_EXPERTS-1) bounds[MM_IDS_ROUTE_EXPERTS]=prefix+total;
+    for (int chunk=0;chunk<chunks;++chunk) {
+        const int index=chunk*MM_IDS_ROUTE_EXPERTS+expert;
+        const int count=offsets[index];
+        offsets[index]=prefix;
+        prefix+=count;
+    }
+}
+
+static __global__ void mm_ids_route_scatter(
+        const uint32_t * sorted, const int32_t * offsets, const int32_t * starts,
+        int32_t * src_map, int32_t * dst_map, int chunks, int channels, int token_stride, bool inverse) {
+    const int index=blockIdx.x*blockDim.x+threadIdx.x;
+    if (index>=chunks*MM_IDS_ROUTE_TILE) return;
+    const uint32_t key=sorted[index];
+    if (key==UINT32_MAX) return;
+    const int chunk=index/MM_IDS_ROUTE_TILE;
+    const int expert=key>>MM_IDS_ROUTE_BITS;
+    const int local=index%MM_IDS_ROUTE_TILE;
+    const int route=chunk*MM_IDS_ROUTE_TILE+(key&(MM_IDS_ROUTE_TILE-1));
+    const int target=offsets[chunk*MM_IDS_ROUTE_EXPERTS+expert]+local-starts[chunk*MM_IDS_ROUTE_EXPERTS+expert];
+    dst_map[target]=route;
+    if (inverse) src_map[route]=target;
+    else src_map[target]=(route/MM_IDS_ROUTE_USED)*token_stride+(route%MM_IDS_ROUTE_USED)%channels;
+}
+
+bool ggml_cuda_launch_mm_ids_bounded(
+        ggml_backend_cuda_context & ctx, const int32_t * ids, int32_t * src_map,
+        int32_t * dst_map, int32_t * bounds, int experts, int tokens, int used,
+        int channels, int ids_stride, int token_stride, bool inverse, cudaStream_t stream) {
+    const int device=ctx.device;
+    if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) ||
+            experts!=MM_IDS_ROUTE_EXPERTS || used!=MM_IDS_ROUTE_USED ||
+            tokens<=4096 || tokens>32768 || (channels!=1 && channels!=used) ||
+            ids_stride<used || token_stride<channels) return false;
+    const int routes=tokens*used;
+    const int chunks=(routes+MM_IDS_ROUTE_TILE-1)/MM_IDS_ROUTE_TILE;
+    ggml_cuda_pool_alloc<uint32_t> sorted(ctx.pool(device),size_t(chunks)*MM_IDS_ROUTE_TILE);
+    ggml_cuda_pool_alloc<int32_t> offsets(ctx.pool(device),size_t(chunks)*experts);
+    ggml_cuda_pool_alloc<int32_t> starts(ctx.pool(device),size_t(chunks)*experts);
+    mm_ids_route_sort<<<chunks,256,0,stream>>>(ids,sorted.get(),offsets.get(),starts.get(),routes,chunks,ids_stride);
+    mm_ids_route_prefix<<<1,MM_IDS_ROUTE_EXPERTS,0,stream>>>(offsets.get(),bounds,chunks);
+    mm_ids_route_scatter<<<(chunks*MM_IDS_ROUTE_TILE+255)/256,256,0,stream>>>
+        (sorted.get(),offsets.get(),starts.get(),src_map,dst_map,chunks,channels,token_stride,inverse);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "ggml-backend.h"
 
 #include <string>
 #include <type_traits>
@@ -74,9 +75,6 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
     return res;
 }
 
-// Prefetch the host pages needed to gather these rows.
-void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
-
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
     ~time_meas();
@@ -96,7 +94,11 @@ struct buffer_view {
     }
 };
 
-void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size);
+// see docs/development/backend-scheduler.md
+static inline void llama_host_write(struct ggml_tensor * t) {
+    GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+    ggml_backend_tensor_set_direct(t, 0, ggml_nbytes(t));
+}
 
 void replace_all(std::string & s, const std::string & search, const std::string & replace);
 

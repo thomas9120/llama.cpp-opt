@@ -9,7 +9,7 @@
 
 // API utilities
 export { getAuthHeaders, getJsonHeaders, sanitizeHeaders } from './api-headers';
-export { ApiError, apiDelete, apiFetch, apiFetchWithParams, apiPost } from './api-fetch';
+export { ApiError, apiFetch, apiFetchWithParams, apiPost } from './api-fetch';
 export { validateApiKey } from './api-key-validation';
 
 // Attachment utilities
@@ -106,9 +106,6 @@ export {
 
 // Model name utilities
 export { normalizeModelName, isValidModelName } from './model-names';
-
-// Sidecar token utilities
-export { isAuxSidecar, isDraftSidecar, sidecarFromFileToken, sidecarFromTag } from './sidecars';
 
 // Portal utilities
 export { portalToBody } from './portal-to-body';
@@ -343,13 +340,7 @@ export { buildSandboxToolDefinition, SANDBOX_TOOL_DEFINITION } from './sandbox-t
 export { executeGetDatetimeTool } from './get-datetime';
 
 // Browser fallback for the server's get_info tool
-export { detectOs, executeBrowserInfoTool } from './browser-info';
-
-// Tool-use support detection from a chat template
-export { detectToolUseSupport } from './chat-template-tool-detector';
-
-// Model memory estimation
-export { minMemoryTierGb } from './model-compatibility';
+export { executeBrowserInfoTool } from './browser-info';
 
 // Cryptography utilities
 

@@ -125,13 +125,6 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    if (is_empty()) {
-        if (n_rs_seq > 0) {
-            n_rs_seq = 0;
-            LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
-        }
-    }
-
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
@@ -192,6 +185,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         // could be fatal
         return false;
     }
+    // a cache with no resident recurrent layers holds no state that could be partially
+    // erased, so the restriction does not apply to it. this is the glm5next MTP draft
+    // context, which runs only the NextN block and filters every KDA layer out.
+    const bool has_state = std::any_of(s_l.begin(), s_l.end(),
+            [](const ggml_tensor * t) { return t != nullptr; });
+
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
@@ -199,11 +198,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                // the filter kept no layer (e.g. an MTP draft context), so only the position moves back
-                if (is_empty()) {
-                    cell.pos = p0 - 1;
-                    return true;
-                }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
@@ -212,14 +206,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     cell.pos = p0 - 1;
                     return true;
                 }
-                return false;
+                if (has_state) {
+                    return false;
+                }
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
             }
         }
-    } else {
+    } else if (seq_id < 0) {
         // seq_id is negative, then the range should include everything or nothing
         if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
             //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: `seq_id` is negative, so returning false\n");
@@ -671,8 +667,18 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
-            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
-                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+            // A hybrid model that filters out every recurrent layer leaves this cache with no tensors.
+            // The hybrid then skips seq_rm on it, so its positions are never rewound and a rejected
+            // speculative draft trips this on every step - with no state to be inconsistent about.
+            bool has_state = false;
+            for (ggml_tensor * t : r_l) { if (t) { has_state = true; break; } }
+            if (!has_state) {
+                for (ggml_tensor * t : s_l) { if (t) { has_state = true; break; } }
+            }
+            if (has_state) {
+                LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+                    __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+            }
         }
         cell.pos = last_pos;
         cell.seq_id.clear();
@@ -728,12 +734,6 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
-}
-
-bool llama_memory_recurrent::is_empty() const {
-    const bool res = ctxs_bufs.empty();
-    assert(!res || total_size() == 0);
-    return res;
 }
 
 size_t llama_memory_recurrent::total_size() const {
@@ -870,12 +870,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     bool res = true;
 
-    // save the head of the restored cells - could be needed to clear the state
-    // the head is valid only when state_read_meta() succeeded
-    const bool meta_read = state_read_meta(io, cell_count, seq_id);
-    const uint32_t cell_head = head;
-
-    res = res && meta_read;
+    res = res && state_read_meta(io, cell_count, seq_id);
 
     try {
         res = res && state_read_data(io, cell_count);
@@ -884,7 +879,12 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 
     if (!res) {
-        state_clear(seq_id, cell_head, meta_read ? cell_count : 0);
+        // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
+        if (seq_id == -1) {
+            clear(true);
+        } else {
+            seq_rm(seq_id, -1, -1);
+        }
         throw std::runtime_error("failed to restore kv cache");
     }
 
@@ -1010,11 +1010,6 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
     if (dest_seq_id != -1) {
         // single sequence
-        if (cell_count > size) {
-            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
-            return false;
-        }
-
         seq_rm(dest_seq_id, -1, -1);
 
         if (cell_count == 0) {
@@ -1244,41 +1239,6 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
 
     return true;
-}
-
-// the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
-// the transposed s layout is not handled - state_read_data() rejects it before any write
-void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count) {
-    // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
-    if (seq_id == -1) {
-        clear(true);
-        return;
-    }
-
-    seq_rm(seq_id, -1, -1);
-
-    if (cell_count == 0) {
-        return;
-    }
-
-    const uint32_t n_layer = hparams.n_layer();
-
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (r_l[il] != nullptr) {
-            const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-            llama_clear_tensor_data(r_l[il], cell_head * r_size_row, cell_count * r_size_row);
-        }
-
-        if (s_l[il] != nullptr) {
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
-        }
-
-        if (p_l[il] != nullptr) {
-            const size_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
-            llama_clear_tensor_data(p_l[il], cell_head * p_size_row, cell_count * p_size_row);
-        }
-    }
 }
 
 //

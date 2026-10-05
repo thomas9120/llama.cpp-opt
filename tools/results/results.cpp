@@ -32,12 +32,14 @@ static std::vector<float> get_logits(
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
-    common_batch batch(lctx);
+    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        batch.add(tokens[pos], pos, 0, true);
+        common_batch_add(batch, tokens[pos], pos, {0}, true);
     }
-    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+    batch.n_tokens = n_tokens;
+    if (llama_decode(lctx, batch)) {
+        llama_batch_free(batch);
         throw std::runtime_error("failed to decode batch");
     }
 
@@ -49,6 +51,7 @@ static std::vector<float> get_logits(
             ret.push_back(logits_ith[j]);
         }
     }
+    llama_batch_free(batch);
     return ret;
 }
 

@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 11
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 4
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -219,6 +219,7 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_DIRECT = 3,
     };
 
     enum llama_context_type {
@@ -291,11 +292,6 @@ extern "C" {
         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT,
         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU,
         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA,
-    };
-
-    enum llama_process_type {
-        LLAMA_PROCESS_TYPE_ENCODE,
-        LLAMA_PROCESS_TYPE_DECODE,
     };
 
     struct llama_model_kv_override {
@@ -482,14 +478,14 @@ extern "C" {
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
     // Initialize the llama + ggml backend
+    // If numa is true, use NUMA optimizations
     // Call once at the start of the program
     LLAMA_API void llama_backend_init(void);
 
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 
-    // Optional: enable numa optimizations
-    // TODO: deprecate and make part of llama_backend_init()
+    //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
     // Optional: an auto threadpool gets created in ggml if not passed explicitly
@@ -1004,91 +1000,6 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
-    //
-    // Extended batch API
-    //
-
-    struct llama_batch_ext;
-
-    struct llama_embd {
-        const float * data;
-        size_t n_rows; // number of embedding rows in data
-        size_t n_embd; // size of one row
-    };
-
-    LLAMA_API struct llama_batch_ext * llama_batch_ext_init (struct llama_context * ctx);
-    LLAMA_API void                     llama_batch_ext_free (struct llama_batch_ext * batch);
-    LLAMA_API void                     llama_batch_ext_clear(struct llama_batch_ext * batch);
-
-    // Add an input token to the batch, with default values:
-    //     id = LLAMA_TOKEN_NULL
-    //     embd = nullptr
-    //     pos = not set, the caller must set it with llama_batch_ext_set_pos()
-    // Returns the batch index (>= 0)
-    // On error:
-    //     -1: batch is full
-    //     -2: token is invalid (id == LLAMA_TOKEN_NULL or invalid embd)
-    //     -3: invalid sequence id
-    LLAMA_API int32_t llama_batch_ext_add      (struct llama_batch_ext * batch, llama_seq_id seq_id);
-
-    // Add an input token to the batch, with a specified token ID or token embedding
-    LLAMA_API int32_t llama_batch_ext_add_token(struct llama_batch_ext * batch, llama_seq_id seq_id, llama_token id);
-    LLAMA_API int32_t llama_batch_ext_add_embd (struct llama_batch_ext * batch, llama_seq_id seq_id, struct llama_embd embd);
-
-    // Add the token at index idx in the batch to another sequence id. The position will stays the same.
-    // Note: this should be called before other _set() functions
-    LLAMA_API bool llama_batch_ext_add_seq(
-                                struct llama_batch_ext * batch,
-                                               int32_t   idx,
-                                          llama_seq_id   seq_id);
-
-    // Set the token embedding for the token at index idx in the batch
-    // use it after llama_batch_ext_add_token() to have an entry with both a token id and an embedding
-    LLAMA_API bool llama_batch_ext_set_embd_token(
-                                struct llama_batch_ext * batch,
-                                               int32_t   idx,
-                                     struct llama_embd   embd);
-
-    // Set the "state" embedding for the token at index idx in the batch
-    // "state" here means extra hidden state carried over from a previous stage, e.g.:
-    //   - MTP: state from N layers of the target model
-    //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
-    LLAMA_API bool llama_batch_ext_set_embd_state(
-                                struct llama_batch_ext * batch,
-                                               int32_t   idx,
-                                     struct llama_embd   embd);
-
-    // Set if output embeddings should be available for the token at index idx in the batch
-    // Note: for now, this is equivalent to setting the output logits
-    LLAMA_API bool llama_batch_ext_set_output_embd(
-                                struct llama_batch_ext * batch,
-                                               int32_t  idx,
-                                                  bool  value);
-
-    // Set output logits for the token at index idx in the batch
-    // Note: for now, this is equivalent to setting the output embd
-    LLAMA_API bool llama_batch_ext_set_output_logits(
-                                struct llama_batch_ext * batch,
-                                               int32_t  idx,
-                                                  bool  value);
-
-    // Set custom position for the token at index idx in the batch
-    // For M-RoPE models:
-    //     - Embedding tokens must have multiple positions per token
-    //     - Text token only requires one single position per token
-    LLAMA_API bool llama_batch_ext_set_pos(
-                                struct llama_batch_ext * batch,
-                                               int32_t   idx,
-                                       const llama_pos * pos);
-
-    // TODO: implement get_embeddings() and get_logits() for llama_batch_ext
-
-    // Return values are the same as llama_decode()
-    LLAMA_API int32_t llama_process(
-                                struct llama_context * ctx,
-                             enum llama_process_type   type,
-                              struct llama_batch_ext * batch);
-
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1107,9 +1018,6 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
-
-    // Returns whether the context is currently using causal attention
-    LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
@@ -1537,7 +1445,6 @@ extern "C" {
                                 size_t num_trigger_tokens),
         "use llama_sampler_init_grammar_lazy_patterns instead");
 
-
     /// @details Lazy grammar sampler, introduced in https://github.com/ggml-org/llama.cpp/pull/9639
     /// @param trigger_patterns A list of patterns that will trigger the grammar sampler. Pattern will be matched from the start of the generation output, and grammar sampler will be fed content starting from its first match group.
     /// @param trigger_tokens A list of tokens that will trigger the grammar sampler. Grammar sampler will be fed content starting from the trigger token included.
@@ -1549,7 +1456,6 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
-
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(

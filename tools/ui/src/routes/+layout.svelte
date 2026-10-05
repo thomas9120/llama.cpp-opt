@@ -335,7 +335,7 @@
 
 	<ModeWatcher />
 
-	<Toaster closeButton richColors />
+	<Toaster richColors />
 </Tooltip.Provider>
 
 <!-- PWA update prompt + version -->

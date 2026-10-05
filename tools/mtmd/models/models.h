@@ -50,11 +50,6 @@ struct clip_graph_qwen3vl : clip_graph_qwen2vl {
     ggml_cgraph * build() override;
 };
 
-struct clip_graph_ling3vl : clip_graph_qwen3vl {
-    clip_graph_ling3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_qwen3vl(ctx, img) {}
-    ggml_cgraph * build() override;
-};
-
 struct clip_graph_minimax_m3 : clip_graph {
     clip_graph_minimax_m3(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
@@ -185,6 +180,11 @@ struct clip_graph_gemma4ua : clip_graph {
 
 struct clip_graph_glm4v : clip_graph {
     clip_graph_glm4v(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
+struct clip_graph_glm5next : clip_graph_glm4v {
+    clip_graph_glm5next(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_glm4v(ctx, img) {}
     ggml_cgraph * build() override;
 };
 

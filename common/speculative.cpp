@@ -30,45 +30,6 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
-// Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
-// both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
-static void spec_retune(
-        std::vector<common_sampler_ptr> & smpls,
-        std::vector<common_params_sampling> & cfg,
-        const llama_model * model,
-        llama_seq_id seq_id,
-        float temp,
-        uint32_t seed) {
-    if (cfg.size() != smpls.size()) {
-        const size_t n_old = cfg.size();
-        cfg.resize(smpls.size());
-
-        // the initial sampler has no temperature, so no request may match the cache and skip a rebuild
-        for (size_t i = n_old; i < cfg.size(); ++i) {
-            cfg[i].temp = NAN;
-        }
-    }
-
-    auto & cur = cfg[seq_id];
-
-    if (cur.temp == temp && cur.seed == seed) {
-        return;
-    }
-
-    cur.temp = temp;
-    cur.seed = seed;
-
-    common_params_sampling sparams;
-    sparams.no_perf  = false;
-    sparams.top_k    = 10;
-    sparams.temp     = cur.temp;
-    // must be explicit, the default reseeds at random; mixed so it differs from the target's
-    sparams.seed     = cur.seed == LLAMA_DEFAULT_SEED ? cur.seed : cur.seed ^ 0x85ebca6bu;
-    sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
-
-    smpls[seq_id].reset(common_sampler_init(model, sparams));
-}
-
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -103,7 +64,7 @@ struct common_speculative_config {
             const common_params_speculative & p = common_params_speculative{}) : type(t), params(p) {}
 };
 
-bool common_speculative_are_compatible(
+static bool common_speculative_are_compatible(
     const llama_model * model_tgt,
     const llama_model * model_dft) {
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
@@ -198,13 +159,79 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
+    // Adaptive draft length.
+    //
+    // Drafting more tokens than the target will accept is pure waste: the draft
+    // pays for every token it proposes, and the target verifies all of them, but
+    // everything after the first rejection is discarded. A fixed n_max therefore
+    // overshoots on unpredictable content (prose) and undershoots on predictable
+    // content (JSON, verbatim quoting) -- which is exactly why MTP measures worse
+    // at n=7 than at n=3 on every content class while DFlash2 prefers 7.
+    //
+    // Track an EMA of how many tokens the target actually accepted per draft and
+    // size the next draft just above it. Sizing to ema+1 keeps one token of
+    // headroom so the estimate can climb again when content becomes predictable.
+    // The action censors the measurement: if every drafted token is accepted we
+    // only learn the true acceptance was *at least* n_drafted, never how much
+    // further it would have gone. Averaging a censored sample would ratchet the
+    // draft length down and strand it there. So the two outcomes are treated as
+    // different observations:
+    //   partial accept -> uncensored, we saw the exact stopping point: track it
+    //   full accept    -> censored, a lower bound only: probe upward instead
+    // Backing off is averaged (gentle), probing is additive (faster), so the
+    // controller recovers quickly when content turns predictable again.
+    std::vector<float>   acc_ema;      // per-seq EMA of accepted tokens per draft
+    std::vector<int32_t> n_last_draft; // per-seq size of the draft just issued
+    bool adaptive_n = false;           // enabled by --spec-draft-adaptive
+
+    static constexpr float acc_ema_alpha  = 0.25f; // ~4-step memory
+    static constexpr float acc_ema_probe  = 1.0f;  // additive growth on a clean draft
+    static constexpr float acc_ema_init   = 2.0f;
+
+    void update_acc_ema(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+            return;
+        }
+        const int32_t n_drafted = n_last_draft[seq_id];
+        if (n_drafted > 0 && (int32_t) n_accepted >= n_drafted) {
+            acc_ema[seq_id] += acc_ema_probe;   // censored: lower bound, probe up
+        } else {
+            acc_ema[seq_id] = (1.0f - acc_ema_alpha) * acc_ema[seq_id] + acc_ema_alpha * (float) n_accepted;
+        }
+        n_last_draft[seq_id] = 0;
+    }
+
+    // reset on a new prompt / reused server slot; never mid-generation, since
+    // tracking content drift within a response is the point of the EMA
+    void reset_acc_ema(llama_seq_id seq_id) {
+        if (seq_id >= 0 && (size_t) seq_id < acc_ema.size()) {
+            acc_ema[seq_id]      = acc_ema_init;
+            n_last_draft[seq_id] = 0;
+        }
+    }
+
+    // effective draft length for this step, never above the configured n_max
+    int32_t adaptive_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
+        if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+            return n_cfg;
+        }
+        const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
+        const int32_t n      = std::min(n_cfg, std::max(std::max(1, n_min), n_want));
+        acc_ema[seq_id]      = std::min(acc_ema[seq_id], (float) n_cfg); // do not let the probe run away
+        return n;
+    }
+
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {
+        // start optimistic so a predictable prefix is not throttled from step one
+        acc_ema.assign(n_seq, acc_ema_init);
+        n_last_draft.assign(n_seq, 0);
+    }
 
     virtual ~common_speculative_impl() = default;
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
-    virtual bool process(const common_batch & batch) = 0;
+    virtual bool process(const llama_batch & batch) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -218,15 +245,9 @@ struct common_speculative_impl {
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
 
-    common_batch batch;
-
-    // zero row at the draft input width, stands in for target embeddings the draft cannot read
-    std::vector<float> zeros;
-    bool zeros_warned = false; // the substitution is reported once
+    llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
-
-    std::vector<common_params_sampling> smpls_cfg;
 
     common_speculative_impl_draft_simple(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, n_seq, params.draft.n_max)
@@ -239,9 +260,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             throw std::runtime_error("draft-simple requires a draft context");
         }
 
-        zeros.assign(llama_model_n_embd_inp(llama_get_model(ctx_dft)), 0.0f);
-
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
+        adaptive_n = this->params.adaptive;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -251,7 +271,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        batch = common_batch(ctx_dft);
+        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
 
         // TODO: optimize or pass from outside?
         // {
@@ -275,7 +295,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             common_params_sampling params;
             params.no_perf = false;
             params.top_k = 10;
-            params.samplers.assign(1, COMMON_SAMPLER_TYPE_TOP_K);
+            params.samplers = {
+                COMMON_SAMPLER_TYPE_TOP_K,
+            };
 
             smpl.reset(common_sampler_init(llama_get_model(ctx_dft), params));
         }
@@ -296,47 +318,21 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
     }
 
-    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
-        // reset here rather than per round, or two identical requests differ
-        common_sampler_reset(smpls[seq_id].get());
+    ~common_speculative_impl_draft_simple() override {
+        llama_batch_free(batch);
     }
 
-    bool process(const common_batch & batch_in) override {
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        // noop
+    }
+
+    bool process(const llama_batch & batch) override {
         auto * ctx_dft = params.ctx_dft;
 
-        // copy the entries to a batch owned by the draft context, only the last token is output
-        batch.clear();
-        const int32_t n_tokens = batch_in.size();
-        for (int32_t k = 0; k < n_tokens; ++k) {
-            const auto & t = batch_in.tokens[k];
-            const bool output = k == n_tokens - 1;
-            if (t.id != LLAMA_TOKEN_NULL) {
-                const int32_t idx = batch.add(t.id, t.pos[0], t.seq_id, output);
-                if (t.embd.data) {
-                    batch.set_embd(idx, t.embd);
-                }
-            } else {
-                // mtmd input is projected by the target encoder, a draft with a different width cannot read it
-                // it gets zeros instead, keeping its positions contiguous
-                // ref: https://github.com/ggml-org/llama.cpp/pull/29385#discussion_r4124743243
-                const size_t n_embd = t.embd.n_rows * t.embd.n_embd;
-                const bool same_width = n_embd == zeros.size();
-                if (!same_width && !zeros_warned) {
-                    SPC_WRN("target embeddings of size %zu do not fit the draft input width %zu, "
-                            "the draft receives zero rows for them and drafts after multimodal input will be poor\n",
-                            n_embd, zeros.size());
-                    zeros_warned = true;
-                }
-                const llama_embd embd = same_width ? t.embd : llama_embd{ zeros.data(), 1, zeros.size() };
-                batch.add_embd(embd, t.pos.data(), t.seq_id, output);
-            }
-        }
+        llama_batch batch_dft = batch;
+        batch_dft.logits = nullptr;
 
-        if (batch.size() == 0) {
-            return true;
-        }
-
-        const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        const int ret = llama_decode(ctx_dft, batch_dft);
 
         if (ret != 0) {
             SPC_ERR("failed to decode draft batch, ret = %d\n", ret);
@@ -350,7 +346,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        batch.clear();
+        common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
@@ -365,27 +361,14 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
-            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
-            if (!params.probabilistic) {
-                dp.result_q = nullptr;
-            }
+            common_sampler_reset(smpls[seq_id].get());
 
-            // result_q is only set when the caller wants rejection, so it also gates the retune
-            if (dp.result_q) {
-                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
-            }
-
-            // a reset reseeds the chain, which breaks probabilistic drafting
-            if (!dp.result_q) {
-                common_sampler_reset(smpls[seq_id].get());
-            }
-
-            batch.add(dp.id_last, dp.pos0, seq_id, true);
+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
         }
 
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
-            SPC_ERR("llama_process returned %d\n", ret);
+            SPC_ERR("llama_decode returned %d\n", ret);
             return;
         }
 
@@ -394,7 +377,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         while (n_drafting > 0) {
             int i_batch = 0;
 
-            batch.clear();
+            common_batch_clear(batch);
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
@@ -403,7 +386,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+
+                common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -415,7 +400,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -432,28 +417,24 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-                }
-
-                if ((params.n_max <= (int) result.size()) ||
+                if ((n_draft_eff <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
                 }
 
-                batch.add(id, dp.pos0 + i + 1, seq_id, true);
+                common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
             }
 
-            if (batch.size() == 0) {
+            if (batch.n_tokens == 0) {
                 break;
             }
 
             // evaluate the drafted tokens on the draft model
-            ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
-                SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
 
@@ -513,8 +494,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //      encoder+decoder on n_accepted+1 rows).
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     common_params_speculative_draft params;
-    common_batch batch;     // decoder input, (token, g_embd) pairs
-    common_batch batch_enc; // encoder input, built from the extracted target features
+    llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -547,6 +527,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         , params(params.draft)
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
+        adaptive_n = this->params.adaptive;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -568,8 +549,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         n_embd_enc = (int32_t) target_layer_ids_n * n_embd_tgt;
         n_layer_tgt = llama_model_n_layer(model_tgt);
 
-        batch     = common_batch(ctx_dft);
-        batch_enc = common_batch(ctx_dft);
+        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd_dec, /*n_seq_max=*/ 1);
+        // llama_batch_init allocates only one of token/embd; eagle3 decoder needs both.
+        // TODO: fix, how to call without malloc
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -631,6 +615,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+
+        if (batch.token != nullptr) {
+            free(batch.token);
+            batch.token = nullptr;
+        }
+        llama_batch_free(batch);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -649,16 +639,16 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    bool process(const common_batch & batch_in) override {
-        if (batch_in.size() <= 0) {
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0) {
             return true;
         }
 
-        if (!batch_in.has_token() || batch_in.has_embd()) {
+        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
         }
 
-        const int32_t n_tokens = batch_in.size();
+        const int32_t n_tokens = batch_in.n_tokens;
 
         // i_batch_beg[seq] / i_batch_end[seq]: inclusive batch indices of this seq's
         // first/last token in batch_in. Assumes per-seq tokens are contiguous within
@@ -666,7 +656,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
         for (int k = 0; k < n_tokens; ++k) {
-            const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+            const llama_seq_id seq_id = batch_in.seq_id[k][0];
             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
                 continue;
             }
@@ -700,23 +691,24 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         g_embd_buf.resize((size_t) n_tokens * n_embd_dec);
 
-        // llama_process() requires the full encoder batch to fit in n_ubatch.
+        // llama_encode() requires the full encoder batch to fit in n_ubatch.
         // Allow batch > ubatch: eagle3's per-token encoder can be chunked safely.
         const int32_t n_ubatch_dft = (int32_t) llama_n_ubatch(ctx_dft);
         for (int32_t i = 0; i < n_tokens; i += n_ubatch_dft) {
             const int32_t n_chunk = std::min(n_ubatch_dft, n_tokens - i);
 
-            // the per-token encoder does not use positions, generate placeholder ones from the memory state
-            batch_enc.clear();
-            llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) + 1;
-            for (int32_t j = 0; j < n_chunk; ++j) {
-                batch_enc.add_embd({ features_buf.data() + (size_t) (i + j) * n_embd_enc, 1, (size_t) n_embd_enc }, &pos, 0, true);
-                pos++;
-            }
-
-            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_ENCODE, batch_enc.get());
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data() + (size_t) i * n_embd_enc,
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+            const int32_t rc = llama_encode(ctx_dft, enc_batch);
             if (rc != 0) {
-                SPC_ERR("llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                SPC_ERR("llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                         rc, (int) n_chunk, (int) i);
                 return false;
             }
@@ -744,7 +736,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         //       deferred boundary, completed by the next process() or draft() call.
         //   (c) refresh deferred state — stash this ubatch's full g_embd into verify_g,
         //       update pending_g_last / pending_pos_last to the last row.
-        batch.clear();
+        common_batch_clear(batch);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             const int32_t beg = i_batch_beg[seq_id];
@@ -759,34 +751,36 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             //   2) pending_pos_last + 1 == pos[beg]
             //   3) pending_pos_last > dft_pos_max // TODO: is this check needed?
             const llama_pos pending_pos = pending_pos_last[seq_id];
-            if (pending_pos >= 0 && pending_pos + 1 == batch_in.tokens[beg].pos[0]) {
+            if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg]) {
                 const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
                 if (pending_pos > dft_pos_max) {
-                    const int32_t idx = batch.add(batch_in.tokens[beg].id, pending_pos, seq_id, /*output=*/ false);
-                    batch.set_embd(idx, { pending_g_last[seq_id].data(), 1, (size_t) n_embd_dec });
+                    common_batch_add(batch, batch_in.token[beg], pending_pos, { seq_id }, /*logits=*/ false);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
+                                pending_g_last[seq_id].data(), row_bytes);
                 }
             }
 
             for (int32_t k = beg; k < end; ++k) {
-                const int32_t idx = batch.add(batch_in.tokens[k + 1].id, batch_in.tokens[k].pos[0], seq_id, /*output=*/ false);
-                batch.set_embd(idx, { g_embd + (size_t) k * n_embd_dec, 1, (size_t) n_embd_dec });
+                common_batch_add(batch, batch_in.token[k + 1], batch_in.pos[k], { seq_id }, /*logits=*/ false);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
+                            g_embd + (size_t) k * n_embd_dec, row_bytes);
             }
 
             // refresh deferred state
             const int32_t n_rows = end - beg + 1;
-            verify_pos_first[seq_id] = batch_in.tokens[beg].pos[0];
-            pending_pos_last[seq_id] = batch_in.tokens[end].pos[0];
+            verify_pos_first[seq_id] = batch_in.pos[beg];
+            pending_pos_last[seq_id] = batch_in.pos[end];
             verify_g_rows[seq_id]    = n_rows;
             verify_g[seq_id].resize((size_t) n_rows * n_embd_dec, 0.0f);
             std::memcpy(verify_g[seq_id].data(),       g_embd + (size_t) beg * n_embd_dec, row_bytes * n_rows);
             std::memcpy(pending_g_last[seq_id].data(), g_embd + (size_t) end * n_embd_dec, row_bytes);
         }
 
-        if (batch.size() > 0) {
-            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (batch.n_tokens > 0) {
+            const int32_t rc = llama_decode(ctx_dft, batch);
             if (rc != 0) {
-                SPC_ERR("llama_process(ctx_dft) failed rc=%d (n_tokens=%d, ubatch_pos[0]=%d)\n",
-                        rc, (int) batch.size(), (int) batch_in.tokens[0].pos[0]);
+                SPC_ERR("llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, ubatch_pos[0]=%d)\n",
+                        rc, (int) batch.n_tokens, (int) batch_in.pos[0]);
                 return false;
             }
         }
@@ -797,11 +791,13 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        batch.clear();
+        common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+
+        const size_t row_bytes = (size_t) n_embd_dec * sizeof(float);
 
         // Complete the deferred boundary pair (dp.id_last, pending_g_last) at memory
         // pos pending_pos_last. dp.id_last is target's freshest sample (= corrected
@@ -823,17 +819,19 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pending_pos_last[seq_id], -1);
 
-            const int32_t idx = batch.add(dp.id_last, pending_pos_last[seq_id], seq_id, true);
-            batch.set_embd(idx, { pending_g_last[seq_id].data(), 1, (size_t) n_embd_dec });
+            common_batch_add(batch, dp.id_last, pending_pos_last[seq_id], { seq_id }, true);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
+                        pending_g_last[seq_id].data(),
+                        row_bytes);
         }
 
-        if (batch.size() == 0) {
+        if (batch.n_tokens == 0) {
             return;
         }
 
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
-            SPC_ERR("llama_process returned %d\n", ret);
+            SPC_ERR("llama_decode returned %d\n", ret);
             return;
         }
 
@@ -842,7 +840,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         while (n_drafting > 0) {
             int i_batch = 0;
 
-            batch.clear();
+            common_batch_clear(batch);
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
@@ -850,6 +848,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 }
 
                 auto * smpl = smpls[seq_id].get();
+
+                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 // pre-norm hidden state of this position becomes g_embd for the next step
@@ -882,23 +882,23 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_draft_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
                 }
 
-                const int32_t idx = batch.add(id, pending_pos_last[seq_id] + (i + 1), seq_id, true);
-                batch.set_embd(idx, { prenorm, 1, (size_t) n_embd_dec });
+                common_batch_add(batch, id, pending_pos_last[seq_id] + (i + 1), { seq_id }, true);
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec, prenorm, row_bytes);
             }
 
-            if (batch.size() == 0) {
+            if (batch.n_tokens == 0) {
                 break;
             }
 
-            ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
-                SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
 
@@ -982,10 +982,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
 
-    common_batch batch;        // noise tokens
-    common_batch batch_inject; // target features for KV cache injection
-
-    std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
+    llama_batch batch;        // noise tokens
+    llama_batch batch_inject; // target features for KV cache injection
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1066,6 +1064,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
+        adaptive_n = this->params.adaptive;
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -1081,11 +1080,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
-        batch        = common_batch(ctx_dft);
-        batch_inject = common_batch(ctx_dft);
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+        batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
-        // embd batches on an M-RoPE draft carry 4 position rows per token
+        // embd batches on an M-RoPE draft need 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+        if (is_mrope) {
+            free(batch_inject.pos);
+            batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1134,6 +1137,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+
+        llama_batch_free(batch);
+        llama_batch_free(batch_inject);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1154,8 +1160,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    bool process(const common_batch & batch_in) override {
-        if (batch_in.size() <= 0) {
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0) {
             return true;
         }
 
@@ -1163,19 +1169,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // produce the target-layer features used to seed the draft KV cache, so
         // embeddings are injected too, except the pinned ones skipped below.
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
-        const bool has_tokens     = batch_in.has_token();
-        const bool has_embeddings = batch_in.has_embd();
+        const bool has_tokens     = batch_in.token != nullptr;
+        const bool has_embeddings = batch_in.embd  != nullptr;
         if (has_tokens == has_embeddings) {
             return true;
         }
 
-        const int32_t n_tokens = batch_in.size();
+        const int32_t n_tokens = batch_in.n_tokens;
 
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
         for (int32_t k = 0; k < n_tokens; ++k) {
-            const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+            const llama_seq_id seq_id = batch_in.seq_id[k][0];
             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
                 continue;
             }
@@ -1198,7 +1205,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
+            const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
             if (has_embeddings && n_rows > 1 && pos_pinned) {
                 continue;
             }
@@ -1208,28 +1215,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
 
-                batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
-                    const llama_pos pos_arr[4] = { p, p, p, 0 };
-                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                    batch_inject.pos[i] = p;
+                    if (is_mrope) {
+                        batch_inject.pos[1 * n_chunk + i] = p;
+                        batch_inject.pos[2 * n_chunk + i] = p;
+                        batch_inject.pos[3 * n_chunk + i] = 0;
+                    }
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = seq_id;
+                    batch_inject.logits[i]    = false;
                 }
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
-                    LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
@@ -1242,7 +1255,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        batch.clear();
+        common_batch_clear(batch);
 
         // build one batch holding every drafting sequence's noise block into a single decode)
         // record where each block starts and its size
@@ -1259,24 +1272,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            // DFlash decodes the whole block in one pass, so a shorter block does
+            // not save draft time -- but it does shrink the target's verification
+            // batch, which is where the cost actually is.
+            const int32_t n_draft = adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
-            i_block_beg[seq_id] = batch.size();
+            i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2);
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
             }
         }
 
-        if (batch.size() == 0) {
+        if (batch.n_tokens == 0) {
             return;
         }
 
         // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
-            LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
 
@@ -1390,11 +1406,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
-    common_batch batch;
+    llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
-
-    std::vector<common_params_sampling> smpls_cfg;
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
@@ -1439,6 +1453,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+        adaptive_n = this->params.adaptive;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -1448,7 +1463,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        batch = common_batch(ctx_dft);
+        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        // llama_batch_init allocates only one of token/embd; MTP needs both.
+        // TODO: fix, how to call without malloc
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1478,7 +1497,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        char arch[64] = {0};
+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -1513,12 +1534,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+
+        if (batch.token != nullptr) {
+            free(batch.token);
+            batch.token = nullptr;
+        }
+        llama_batch_free(batch);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        // reset here rather than per round, or two identical requests differ
-        common_sampler_reset(smpls[seq_id].get());
-
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1530,23 +1554,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
-                    "(need_embd / output flag on every prompt position?). "
+                    "(need_embd / logits=1 on every prompt position?). "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 1);
         }
     }
 
-    bool process(const common_batch & batch_in) override {
-        if (batch_in.size() <= 0) {
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0) {
             return true;
         }
 
         // TODO: how to make it work with vision tokens?
-        if (!batch_in.has_token() || batch_in.has_embd()) {
+        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
         }
 
-        const int32_t n_tokens = batch_in.size();
+        const int32_t n_tokens = batch_in.n_tokens;
 
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -1554,7 +1578,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         for (int k = 0; k < n_tokens; ++k) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (batch_in.tokens[k].seq_id == seq_id) {
+                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+
+                if (batch_in.seq_id[k][0] == seq_id) {
                     i_batch_end[seq_id] = k;
                     if (i_batch_beg[seq_id] < 0) {
                         i_batch_beg[seq_id] = k;
@@ -1570,26 +1596,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
-            batch.clear();
+            common_batch_clear(batch);
 
-            // pair each token with the tgt embedding shifted right by one position, and
-            // the first token of each sequence with the pending embedding from a previous run
+            for (int k = 0; k < n_tokens; ++k) {
+                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+            }
+
+            // shift the tgt embeddings to the right by one position
             // assumes that the tokens in the batch are sequential for each sequence
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            {
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+            }
 
-            for (int k = 0; k < n_tokens; ++k) {
-                const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+            // fill the pending embeddings from a previous run
+            auto set_h = [&](int idx, const float * h_row) {
+                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+            };
 
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
 
-                const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
-
-                batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1602,15 +1635,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         if (i_batch_beg[seq_id] < 0) {
                             continue;
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
                     }
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                const int32_t rc = llama_decode(ctx_dft, batch);
                 if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                            head, (int) rc, (int) batch_in.pos[0]);
                     ok = false;
                     break;
                 }
@@ -1648,11 +1681,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        batch.clear();
+        common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1663,25 +1698,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
-            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
-            if (!params.probabilistic) {
-                dp.result_q = nullptr;
-            }
+            common_sampler_reset(smpls[seq_id].get());
 
-            // result_q is only set when the caller wants rejection, so it also gates the retune
-            if (dp.result_q) {
-                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
-            }
+            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
-            // a reset reseeds the chain, which breaks probabilistic drafting
-            if (!dp.result_q) {
-                common_sampler_reset(smpls[seq_id].get());
-            }
-
-            const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
-
-            i_last[seq_id] = idx;
+            i_last[seq_id] = batch.n_tokens - 1;
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
@@ -1707,16 +1729,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
-                SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.
-            batch.clear();
+            common_batch_clear(batch);
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
@@ -1725,7 +1747,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                // MTP drafts sequentially, so a shorter draft saves draft passes
+                // as well as target verification work.
+                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+
+                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1737,7 +1763,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1754,11 +1780,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-                }
-
-                if (params.n_max <= (int) result.size()) {
+                if (n_draft_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1771,24 +1793,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
                     for (int t = 0; t < n_rows; ++t) {
                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
-                        const int32_t idx = batch.add(tok, dp.pos0 + t, seq_id, t == n_rows - 1);
-                        batch.set_embd(idx, { chain_h[seq_id].data() + (size_t) t * n_embd, 1, (size_t) n_embd });
-                        i_last[seq_id] = idx;
+                        common_batch_add(batch, tok, dp.pos0 + t, { seq_id }, t == n_rows - 1);
+                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                                    chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
                     }
                 } else if (is_mem_shared) {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
-                    const int32_t idx = batch.add(id, dp.pos0, seq_id, true);
-                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
-                    i_last[seq_id] = idx;
+                    common_batch_add(batch, id, dp.pos0, { seq_id }, true);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 } else {
-                    const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
-                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
-                    i_last[seq_id] = idx;
+                    common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
+
+                i_last[seq_id] = batch.n_tokens - 1;
             }
 
-            if (batch.size() == 0) {
+            if (batch.n_tokens == 0) {
                 break;
             }
 
@@ -1850,7 +1872,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const common_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
         return true;
     }
@@ -1898,7 +1920,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         common_ngram_map_begin(config[seq_id], prompt);
     }
 
-    bool process(const common_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
         return true;
     }
@@ -2056,7 +2078,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.n_draft_last = result.size();
     }
 
-    bool process(const common_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
         return true;
     }
@@ -2115,10 +2137,12 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         common_ngram_cache ngram_cache_context;
         common_ngram_cache ngram_cache_dynamic;
-        common_ngram_cache ngram_cache_static;
     };
 
     std::vector<seq_info> sinfos;
+
+    // read-only, shared by all sequences
+    std::shared_ptr<const common_ngram_cache_static> ngram_cache_static;
 
     common_speculative_impl_ngram_cache(
             const common_params_speculative & params,
@@ -2144,11 +2168,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         if (!path_static.empty()) {
             try {
-                auto ngram_cache_static = common_ngram_cache_load(path_static);
-
-                for (auto & sinfo : sinfos) {
-                    sinfo.ngram_cache_static = ngram_cache_static;
-                }
+                ngram_cache_static = common_ngram_cache_static_load(path_static);
             } catch (...) {
                 SPC_ERR("failed to open static lookup cache: %s", path_static.c_str());
                 GGML_ABORT("Couldn't read static lookup cache");
@@ -2210,7 +2230,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                 inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
                 sinfo.ngram_cache_context,
                 sinfo.ngram_cache_dynamic,
-                sinfo.ngram_cache_static);
+                ngram_cache_static.get());
 
         if (result.size() > 0) {
             // delete first token in result (which is the id_last token)
@@ -2218,7 +2238,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    bool process(const common_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/) override {
         // TODO: implement
         return true;
     }
@@ -2846,12 +2866,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
+        impl->reset_acc_ema(seq_id);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -2914,11 +2935,6 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
-
-                        // trim the candidates only if the drafter produced them (n-gram drafters do not)
-                        if (dp.result_q && !dp.result_q->empty()) {
-                            dp.result_q->resize(dp.n_max);
-                        }
                     }
                 }
 
@@ -2929,6 +2945,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    impl->n_last_draft[seq_id] = (int32_t) result.size();
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -2979,6 +2996,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
+        impl->update_acc_ema(seq_id, n_accepted);
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
     }

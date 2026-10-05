@@ -94,7 +94,7 @@ private:
         std::shared_ptr<server_subproc> proc;
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
         int port = 0;
-        std::string buf[SERVER_SUBPROC_STREAMS]; // partial line of each pipe
+        std::string buf;      // partial line
         bool eof = false;     // output closed, waiting for the process to be reaped
         int64_t deadline = 0; // force-kill time in ms, 0 when no stop is pending
     };
@@ -147,56 +147,46 @@ private:
         return false;
     }
 
-    // read what the child wrote, handle its commands and forward its logs, line by line
+    // read what the child wrote, forward complete lines
     void read_output(child_t & c) {
-        for (int i = 0; i < SERVER_SUBPROC_STREAMS; i++) {
-            read_stream(c, (server_subproc_stream) i);
-        }
-        c.eof = c.proc->output_closed();
-    }
-
-    void read_stream(child_t & c, server_subproc_stream stream) {
         char chunk[4096];
-        std::string & buf = c.buf[stream];
-        bool closed = false;
-        while (true) {
-            int n = c.proc->read_output(stream, chunk, sizeof(chunk));
+        while (!c.eof) {
+            int n = c.proc->read_output(chunk, sizeof(chunk));
             if (n < 0) {
-                closed = true;
+                c.eof = true;
                 break;
             }
             if (n == 0) {
                 break;
             }
-            buf.append(chunk, (size_t) n);
+            c.buf.append(chunk, (size_t) n);
             size_t start = 0;
             while (true) {
-                size_t nl = buf.find('\n', start);
+                size_t nl = c.buf.find('\n', start);
                 if (nl == std::string::npos) {
                     break;
                 }
-                on_line(c, stream, buf.substr(start, nl + 1 - start));
+                std::string line = c.buf.substr(start, nl + 1 - start);
                 start = nl + 1;
+                on_line(c, line);
             }
-            buf.erase(0, start);
-            if (buf.size() > max_line) {
-                buf.clear(); // a child that never writes a newline must not grow this without bound
+            c.buf.erase(0, start);
+            if (c.buf.size() > max_line) {
+                c.buf.clear(); // a child that never writes a newline must not grow this without bound
             }
         }
-        if (closed && !buf.empty()) {
-            on_line(c, stream, buf);
-            buf.clear();
+        if (c.eof && !c.buf.empty()) {
+            on_line(c, c.buf);
+            c.buf.clear();
         }
     }
 
-    void on_line(child_t & c, server_subproc_stream stream, const std::string & line) {
-        if (stream == SERVER_SUBPROC_STDERR) {
-            LOG("[%5d] %s", c.port, line.c_str()); // forward log
-        } else if (string_starts_with(line, CMD_CHILD_TO_ROUTER_STATE)) {
+    void on_line(child_t & c, const std::string & line) {
+        if (string_starts_with(line, CMD_CHILD_TO_ROUTER_STATE)) {
             LOG_DBG("[%5d] %s", c.port, line.c_str()); // prevent spamming the log
             models.handle_child_state(c.name, line);
         } else {
-            SRV_WRN("[%5d] unexpected output on the command pipe: %s", c.port, line.c_str());
+            LOG("[%5d] %s", c.port, line.c_str()); // forward log
         }
     }
 
@@ -307,7 +297,7 @@ struct server_lru_sched {
             return;
         }
         queue.push_back({ model_id, 1, false });
-        SRV_INF("request for name=%s queued at position %zu\n",
+        SRV_INF("models_max reached, request for name=%s queued at position %zu\n",
                 model_id.c_str(), queue.size());
     }
 
@@ -480,7 +470,6 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
     preset.unset_option("LLAMA_API_KEY");
-    preset.unset_option("LLAMA_ARG_API_KEY_FILE");
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
@@ -493,6 +482,25 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     }
 }
 
+#ifdef _WIN32
+static std::string wide_to_utf8(const wchar_t * ws) {
+    if (!ws || !*ws) {
+        return {};
+    }
+
+    const int len = static_cast<int>(std::wcslen(ws));
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, ws, len, nullptr, 0, nullptr, nullptr);
+    if (bytes == 0) {
+        return {};
+    }
+
+    std::string utf8(bytes, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, len, utf8.data(), bytes, nullptr, nullptr);
+
+    return utf8;
+}
+#endif
+
 static std::vector<std::string> get_environment() {
     std::vector<std::string> env;
 
@@ -502,7 +510,7 @@ static std::vector<std::string> get_environment() {
         return env;
     }
     for (LPWCH e = env_block; *e; e += wcslen(e) + 1) {
-        env.emplace_back(wstring_to_utf8(e));
+        env.emplace_back(wide_to_utf8(e));
     }
     FreeEnvironmentStringsW(env_block);
 #else
@@ -523,8 +531,6 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
-    // the child output goes through the router to its terminal, so it follows the router colors
-    preset.set_option(ctx_preset, "LLAMA_ARG_LOG_COLORS", common_log_get_colors(common_log_main()) ? "on" : "off");
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
@@ -547,7 +553,7 @@ void server_model_meta::update_caps() {
             "LLAMA_ARG_MMPROJ_URL",
             "LLAMA_ARG_MMPROJ_AUTO",
             "LLAMA_ARG_HF_REPO",
-            "LLAMA_ARG_HF_FILE",
+            "LLAMA_ARG_HF_REPO_FILE",
         });
         params.offline = true;
         common_models_handler handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
@@ -577,15 +583,11 @@ server_models::server_models(
               base_preset(ctx_preset.load_from_args(argc, argv)),
               sched(std::make_unique<server_lru_sched>(*this)),
               monitor(std::make_unique<server_monitor>(*this)) {
-    // propagate base params to child
+    // clean up base preset
     unset_reserved_args(base_preset, true);
-
-    // do not propagate these options, but allow preset to explicitly set them
-    base_preset.unset_option("LLAMA_ARG_LOG_FILE");
-
     // set binary path
     try {
-        bin_path = fs_path_to_utf8(get_server_exec_path());
+        bin_path = get_server_exec_path().string();
     } catch (const std::exception & e) {
         bin_path = argv[0];
         LOG_WRN("failed to get server executable path: %s\n", e.what());
@@ -730,25 +732,21 @@ void server_models::load_models() {
     std::set<std::string> hidden_models;
     {
         std::set<std::string> preset_paths;
-        auto add_hf_path = [&preset_paths](const common_preset & preset, const char * repo_key, const char * file_key) {
-            std::string hf_repo;
-            if (!preset.get_option(repo_key, hf_repo) || hf_repo.empty()) {
-                return;
-            }
-            std::string hf_file;
-            preset.get_option(file_key, hf_file);
-            std::string path = common_download_resolve_path(hf_repo, hf_file);
-            if (!path.empty()) {
-                preset_paths.insert(path);
-            }
-        };
         for (const auto & [name, preset] : custom_presets) {
             std::string val;
             if (!preset.get_option(COMMON_ARG_PRESET_DEDUP_CACHE_MODELS, val) || !common_arg_utils::is_truthy(val)) {
                 continue;
             }
-            add_hf_path(preset, "LLAMA_ARG_HF_REPO", "LLAMA_ARG_HF_FILE");
-            add_hf_path(preset, "LLAMA_ARG_SPEC_DRAFT_HF_REPO", "LLAMA_ARG_SPEC_DRAFT_MODEL");
+            std::string hf_repo;
+            if (!preset.get_option("LLAMA_ARG_HF_REPO", hf_repo) || hf_repo.empty()) {
+                continue;
+            }
+            std::string hf_file;
+            preset.get_option("LLAMA_ARG_HF_FILE", hf_file);
+            std::string path = common_download_resolve_path(hf_repo, hf_file);
+            if (!path.empty()) {
+                preset_paths.insert(path);
+            }
         }
         if (!preset_paths.empty()) {
             for (const auto & [name, preset] : cached_models) {
@@ -808,12 +806,11 @@ void server_models::load_models() {
             inst.meta.hidden = hidden_models.count(name) > 0;
         }
     };
-    // update_args() injects HOST/PORT/ALIAS/LOG_COLORS, so strip them before comparing presets
+    // update_args() injects HOST/PORT/ALIAS, so strip them before comparing presets
     auto preset_options_for_compare = [](common_preset p) {
         p.unset_option("LLAMA_ARG_HOST");
         p.unset_option("LLAMA_ARG_PORT");
         p.unset_option("LLAMA_ARG_ALIAS");
-        p.unset_option("LLAMA_ARG_LOG_COLORS");
         return p.options;
     };
 
@@ -1184,8 +1181,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
         inst.meta.args = child_args; // save for debugging
 
-        // the child writes its commands to stdout and its logs to stderr
-        int options = subprocess_option_no_window;
+        // TODO @ngxson : maybe separate stdout and stderr in the future
+        //                so that we can use stdout for commands and stderr for logging
+        int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
         if (!inst.subproc->sproc.create(child_args, options, child_env)) {
             throw std::runtime_error("failed to spawn server instance");
         }
@@ -1223,16 +1221,15 @@ void server_models::request_stop(const std::string & name, bool send_exit) {
 void server_models::on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code) {
     {
         std::lock_guard<std::mutex> lk(mutex);
+        stopping_models.erase(name);
         auto it = mapping.find(name);
         if (it == mapping.end() || it->second.subproc != proc) {
-            stopping_models.erase(name);
             return; // entry erased, or a newer instance took the name
         }
     }
     if (mode == SERVER_CHILD_MODE_DOWNLOAD) {
         // instance will be cleaned up on next load_models() call
         std::lock_guard<std::mutex> lk(mutex);
-        stopping_models.erase(name);
         cv.notify_all();
     } else {
         update_status(name, {
@@ -1302,9 +1299,6 @@ void server_models::update_status(const std::string & name, const update_status_
         auto & meta = it->second.meta;
         meta.status      = args.status;
         meta.exit_code   = args.exit_code;
-        if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
-            stopping_models.erase(name);
-        }
         if (!args.loaded_info.is_null()) {
             meta.loaded_info = args.loaded_info;
         }
@@ -1444,15 +1438,10 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
-    bool stopping;
-    {
-        std::lock_guard<std::mutex> lk(mutex);
-        stopping = stopping_models.count(name) > 0;
-    }
-    if (!stopping && meta->is_ready()) {
+    if (meta->is_ready()) {
         return false; // ready for taking requests
     }
-    if (!stopping && meta->status == SERVER_MODEL_STATUS_SLEEPING) {
+    if (meta->status == SERVER_MODEL_STATUS_SLEEPING) {
         return false; // child is sleeping but still running; new request will wake it up
     }
 
@@ -1462,10 +1451,17 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
         std::unique_lock<std::mutex> lk(mutex);
         auto it = mapping.find(name);
         if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
-            // the queue entry protects the model from eviction until its waiters leave
-            sched->join(lk, name);
-            sched->tick(lk);
-            queued = true;
+            if (sched->has_capacity(lk) && sched->queue_empty(lk)) {
+                lk.unlock();
+                SRV_INF("model name=%s is not loaded, loading...\n", name.c_str());
+                load(name);
+                did_load = true;
+            } else {
+                // also queue when a slot looks free but others wait already, else they starve
+                sched->join(lk, name);
+                sched->tick(lk);
+                queued = true;
+            }
         }
     }
 
@@ -1485,19 +1481,6 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             auto it = mapping.find(name);
             if (it == mapping.end()) {
                 break; // removed by another code path, nothing to wait for
-            }
-            if (stopping_models.count(name)) {
-                // a stopping instance takes no new request, the next instance serves it
-                if (!queued) {
-                    sched->join(lk, name);
-                    sched->tick(lk);
-                    queued = true;
-                }
-                if (should_stop && should_stop()) {
-                    throw std::runtime_error("request cancelled while waiting for model name=" + name);
-                }
-                cv.wait_for(lk, std::chrono::milliseconds(200));
-                continue;
             }
             const server_model_status status = it->second.meta.status;
 
@@ -1685,18 +1668,6 @@ void server_models::handle_child_state(const std::string & name, const std::stri
 // server_child
 //
 
-server_child::server_child() {
-    if (is_child()) {
-        cmd_out = server_reserve_stdout();
-    }
-}
-
-server_child::~server_child() {
-    if (cmd_out) {
-        fclose(cmd_out);
-    }
-}
-
 bool server_child::is_child() {
     const char * router_port = std::getenv("LLAMA_SERVER_ROUTER_PORT");
     return router_port != nullptr;
@@ -1819,8 +1790,14 @@ void server_child::notify_to_router(const std::string & state, const json & payl
         {"payload", payload},
     };
     std::lock_guard<std::mutex> lk(mtx_stdout);
-    fprintf(cmd_out, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
-    fflush(cmd_out);
+    common_log_pause(common_log_main());
+    fflush(stdout);
+    // the router matches the command on a line prefix, so the leading newline
+    // closes whatever the logger left open on the shared pipe, down to the
+    // trailing color reset that carries no newline of its own
+    fprintf(stdout, "\n%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    fflush(stdout);
+    common_log_resume(common_log_main());
 }
 
 

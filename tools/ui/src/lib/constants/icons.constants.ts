@@ -10,8 +10,7 @@ import {
 	Image as ImageIcon,
 	Lightbulb as ReasoningIcon,
 	Mic as AudioIcon,
-	Video as VideoIcon,
-	Wrench as ToolUseIcon
+	Video as VideoIcon
 } from '@lucide/svelte';
 import { FileTypeCategory, ModelCapability, ModelModality } from '$lib/enums';
 import type { ModelCapabilities, ModelModalities } from '$lib/types/models';
@@ -50,19 +49,16 @@ export const MODALITY_FLAG_KEYS: Record<
 };
 
 export const CAPABILITY_ICONS: Record<ModelCapability, Component> = {
-	[ModelCapability.REASONING]: ReasoningIcon,
-	[ModelCapability.TOOL_USE]: ToolUseIcon
+	[ModelCapability.REASONING]: ReasoningIcon
 } as const;
 
 export const CAPABILITY_LABELS: Record<ModelCapability, string> = {
-	[ModelCapability.REASONING]: 'Reasoning',
-	[ModelCapability.TOOL_USE]: 'Tool use'
+	[ModelCapability.REASONING]: 'Reasoning'
 } as const;
 
 /** Maps a ModelCapability to the boolean flag it drives on the ModelCapabilities type */
 export const CAPABILITY_FLAG_KEYS: Record<ModelCapability, keyof ModelCapabilities> = {
-	[ModelCapability.REASONING]: 'reasoning',
-	[ModelCapability.TOOL_USE]: 'tools'
+	[ModelCapability.REASONING]: 'reasoning'
 };
 
 // Shared SVG icon strings for copy and preview buttons

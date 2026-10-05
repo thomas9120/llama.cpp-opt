@@ -17,7 +17,7 @@ static void print_usage(char* argv0) {
     fprintf(stderr, "Usage: %s [--help] lookup_part_1.bin lookup_part_2.bin ... lookup_merged.bin\n", argv0);
 }
 
-int main(int argc, char ** argv){
+static int merge_caches(int argc, char ** argv){
     std::setlocale(LC_NUMERIC, "C");
 
     if (argc < 3) {
@@ -47,4 +47,14 @@ int main(int argc, char ** argv){
 
     fprintf(stderr, "lookup-merge: saving file %s\n", args.back().c_str());
     common_ngram_cache_save(ngram_cache_merged, args.back());
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    try {
+        return merge_caches(argc, argv);
+    } catch (const std::exception & error) {
+        fprintf(stderr, "lookup-merge: %s\n", error.what());
+        return 1;
+    }
 }

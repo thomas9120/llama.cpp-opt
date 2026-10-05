@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-lazy-reader.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -17,7 +18,6 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
-struct llama_model;
 
 // available models
 enum llm_type {
@@ -149,12 +149,12 @@ enum llm_type {
     LLM_TYPE_288B_A19B, // dots3-note
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
+    LLM_TYPE_313B_A17B, // GLM-5.3-Flash
     LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_397B_A17B, // Qwen3.5
     LLM_TYPE_685B_A37B, // DeepSeek V3.2
     LLM_TYPE_744B_A40B, // GLM-5
     LLM_TYPE_2_8T_A50B, // Kimi-K3
-    LLM_TYPE_320B_A18B, // GLM-5.3-Flash
     LLM_TYPE_E2B,
     LLM_TYPE_E4B,
 };
@@ -234,7 +234,6 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
 
-    // qwen4exp: the MTP block collapses its hyper-connection streams with its own mixer
     struct ggml_tensor * hc_head_norm          = nullptr;
     struct ggml_tensor * hc_head_down          = nullptr;
     struct ggml_tensor * hc_head_up            = nullptr;
@@ -567,10 +566,6 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
-    // glm5-next k-pool indexer
-    struct ggml_tensor * indexer_kpool_gate = nullptr;
-    struct ggml_tensor * indexer_kpool_ape  = nullptr;
-
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
     struct ggml_tensor * index_k_proj = nullptr;
@@ -620,19 +615,6 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
-struct llama_prec_policy {
-    // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
-    // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
-    std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
-
-    // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
-    std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
-
-    bool apply(ggml_tensor * res) const;
-
-    void load(llama_model_loader & ml, const llama_model & model);
-};
-
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -641,9 +623,6 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
-
-    // per-tensor activation precision policy
-    llama_prec_policy prec_policy;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
@@ -684,7 +663,6 @@ struct llama_model {
     struct ggml_tensor * cls_out   = nullptr;
     struct ggml_tensor * cls_out_b = nullptr;
     struct ggml_tensor * cls_norm  = nullptr;
-    struct ggml_tensor * cls_norm_b = nullptr;
 
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
@@ -740,9 +718,6 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
-    // which tensors can be prefetched - driven by TENSOR_READ_LAZY
-    std::unordered_set<const ggml_tensor *> can_prefetch;
-
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -782,6 +757,9 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    // queue readahead for rows a gather is about to read. no-op unless the tensor is mmap'd
+    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
@@ -857,6 +835,14 @@ struct llama_model_base : public llama_model {
     void load_arch_hparams(llama_model_loader & ml) override = 0;
     void load_arch_tensors(llama_model_loader & ml) override = 0;
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
+
+    // --lazy-mode on-direct: read the rows of a lazy tensor with explicit
+    // pread()s instead of demand-faulting them in through the mmap. Call once
+    // per lazy tensor after creating it; returns null if the platform cannot
+    // serve direct reads (the tensor then stays on the lazy mmap path).
+    const llama_lazy_reader * load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t);
+
+    std::map<std::string, std::unique_ptr<llama_lazy_reader>> lazy_readers;
 };
 
 const char * llm_type_name(llm_type type);

@@ -294,8 +294,8 @@ private:
             support = filter_support * filterscale;  // Widen filter when downsampling
             ksize = static_cast<int>(std::ceil(support)) * 2 + 1;  // Total pixels in kernel
 
-            std::vector<double> pre_weights((size_t) outSize * ksize);  // Temporary weights
-            bounds.resize((size_t) outSize * 2);
+            std::vector<double> pre_weights(outSize * ksize);  // Temporary weights
+            bounds.resize(outSize * 2);
 
 
             // For each output pixel, compute its filter coefficients
@@ -322,20 +322,20 @@ private:
                 for (x = 0; x < xmax; x++) {
                     // Distance from input pixel center to output pixel center in input space
                     double w = resample_filter((x + xmin - center + 0.5) * ss);
-                    pre_weights[(size_t) xx * ksize + x] = w;
+                    pre_weights[xx * ksize + x] = w;
                     ww += w;  // Accumulate for normalization
                 }
 
                 // Normalize weights to sum to 1.0 (preserves brightness)
                 for (x = 0; x < xmax; x++) {
                     if (ww != 0.0) {
-                        pre_weights[(size_t) xx * ksize + x] /= ww;
+                        pre_weights[xx * ksize + x] /= ww;
                     }
                 }
 
                 // Zero-pad remaining kernel positions
                 for (; x < ksize; x++) {
-                    pre_weights[(size_t) xx * ksize + x] = 0;
+                    pre_weights[xx * ksize + x] = 0;
                 }
 
                 // Store input pixel range for this output pixel
@@ -345,11 +345,11 @@ private:
 
             // Convert floating-point coefficients to fixed-point integers
             // Formula: int32 = round(float * 2^PRECISION_BITS)
-            weights.resize((size_t) outSize * ksize);
+            weights.resize(outSize * ksize);
 
             const double fxp_scale = std::ldexp(1.0, PRECISION_BITS); // 1.0 * 2^PRECISION_BITS
 
-            for (size_t i = 0; i < (size_t) outSize * ksize; i++) {
+            for (int i = 0; i < outSize * ksize; i++) {
                 // Pillow adds +/- 0.5 then truncates toward zero; std::round would round twice
                 const double rounded = pre_weights[i] * fxp_scale + (pre_weights[i] < 0 ? -0.5 : 0.5);
                 weights[i] = static_cast<int32_t>(rounded);
@@ -441,12 +441,6 @@ private:
         // Main resampling logic using separable two-pass approach
         const int src_width  = img.get_size().width;
         const int src_height = img.get_size().height;
-
-        // sanity check on the target size
-        if (target_width <= 0 || target_width > 65536 || target_height <= 0 || target_height > 65536) {
-            throw std::runtime_error("resize target " + std::to_string(target_width) + "x" +
-                                     std::to_string(target_height) + " is out of range (max 65536)");
-        }
 
         bool need_horizontal = (target_width != src_width);
         bool need_vertical = (target_height != src_height);
@@ -789,75 +783,6 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
-    return output;
-}
-
-//
-// mtmd_image_preprocessor_glm5v
-//
-
-// The canvas is ceil-aligned to patch_size*n_merge and fitted to the token budget.
-// Only rescaled to meet the budget and sits top-left, with black padding on the right and bottom
-mtmd_image_preproc_out mtmd_image_preprocessor_glm5v::preprocess(const clip_image_u8 & img) const {
-    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
-
-    const int64_t factor  = hparams.patch_size * hparams.n_merge;
-    const int64_t min_px  = hparams.image_min_pixels; // single-frame pixel counts
-    const int64_t max_px  = hparams.image_max_pixels;
-    const int64_t height  = img.get_size().height;
-    const int64_t width   = img.get_size().width;
-
-    auto align = [factor](int64_t v) { return (v + factor - 1) / factor * factor; };
-
-    // aligned canvas within the budget
-    int64_t canvas_h = align(height);
-    int64_t canvas_w = align(width);
-
-    if (canvas_h * canvas_w < min_px) {
-        const double scale = std::sqrt((double) min_px / (double) (height * width));
-        canvas_h = align(std::max<int64_t>(1, (int64_t) std::ceil(height * scale)));
-        canvas_w = align(std::max<int64_t>(1, (int64_t) std::ceil(width  * scale)));
-    }
-
-    if (canvas_h * canvas_w > max_px) {
-        // largest content height whose aligned canvas fits the budget
-        int64_t lo = 1, hi = height;
-        int64_t best_h = factor, best_w = factor;
-        while (lo <= hi) {
-            const int64_t ch = (lo + hi) / 2;
-            const int64_t cw = std::max<int64_t>(1, width * ch / height);
-            const int64_t ah = align(ch);
-            const int64_t aw = align(cw);
-            if (ah * aw <= max_px) {
-                best_h = ah;
-                best_w = aw;
-                lo = ch + 1;
-            } else {
-                hi = ch - 1;
-            }
-        }
-        canvas_h = best_h;
-        canvas_w = best_w;
-    }
-
-    // Scaled to fit the canvas, and never upscaled, unless below the min budget
-    double scale = std::min((double) canvas_h / height, (double) canvas_w / width);
-    if (height * width >= min_px) {
-        scale = std::min(1.0, scale);
-    }
-    const int content_h = (int) std::max<int64_t>(1, std::min<int64_t>(canvas_h, (int64_t) std::floor(height * scale)));
-    const int content_w = (int) std::max<int64_t>(1, std::min<int64_t>(canvas_w, (int64_t) std::floor(width  * scale)));
-
-    clip_image_u8 content;
-    img_tool::resize(img, content, clip_image_size{content_w, content_h}, hparams.image_resize_algo, PAD_NONE);
-
-    clip_image_u8 canvas;
-    canvas.set_size(clip_image_size{(int) canvas_w, (int) canvas_h}, img.is_placeholder());
-    img_tool::fill(canvas, {0, 0, 0});
-    img_tool::composite(canvas, content, 0, 0);
-
-    mtmd_image_preproc_out output;
-    output.append(hparams, canvas, true);
     return output;
 }
 
@@ -1808,5 +1733,104 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
 
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
+    return output;
+}
+
+
+// for a still image the reference's temporal_factor cancels out, leaving pixel area vs min/max
+clip_image_size mtmd_image_preprocessor_glm5next::smart_resize(const clip_hparams & hparams, const clip_image_size & size) {
+    const int factor = hparams.patch_size * hparams.n_merge;
+    GGML_ASSERT(factor > 0);
+    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+
+    const int height = size.height;
+    const int width  = size.width;
+    if (height <= 0 || width <= 0) {
+        // an empty bitmap is reachable through the public API
+        return { 0, 0 };
+    }
+
+    const int64_t min_pixels = hparams.image_min_pixels;
+    const int64_t max_pixels = hparams.image_max_pixels;
+
+    auto align = [factor](int64_t value) {
+        return (int) (((value + factor - 1) / factor) * factor);
+    };
+
+    int aligned_height = align(height);
+    int aligned_width  = align(width);
+
+    if ((int64_t) aligned_height * aligned_width < min_pixels) {
+        const double scale = std::sqrt((double) min_pixels / ((double) height * (double) width));
+        aligned_height = align(std::max<int64_t>(1, (int64_t) std::ceil(height * scale)));
+        aligned_width  = align(std::max<int64_t>(1, (int64_t) std::ceil(width  * scale)));
+    }
+
+    if ((int64_t) aligned_height * aligned_width > max_pixels) {
+        // aligning both edges is not monotone in the Qwen sqrt(area / max_pixels) scale, so search
+        int low  = 1;
+        int high = height;
+        aligned_height = factor;
+        aligned_width  = factor;
+        while (low <= high) {
+            const int content_height = (low + high) / 2;
+            // the reference divides in float64 before flooring, keep it bit-identical
+            const int content_width  = std::max(1, (int) std::floor((double) width * content_height / (double) height));
+            const int cand_height    = align(content_height);
+            const int cand_width     = align(content_width);
+
+            if ((int64_t) cand_height * cand_width <= max_pixels) {
+                aligned_height = cand_height;
+                aligned_width  = cand_width;
+                low  = content_height + 1;
+            } else {
+                high = content_height - 1;
+            }
+        }
+    }
+
+    return { aligned_width, aligned_height };
+}
+
+mtmd_image_preprocessor_glm5next::geometry mtmd_image_preprocessor_glm5next::get_geometry(const clip_hparams & hparams, const clip_image_size & size) {
+    const clip_image_size canvas = smart_resize(hparams, size);
+
+    const int height = size.height;
+    const int width  = size.width;
+    if (canvas.width == 0 || canvas.height == 0) {
+        return { canvas, canvas };
+    }
+
+    double scale = std::min((double) canvas.height / height, (double) canvas.width / width);
+    if ((int64_t) height * (int64_t) width >= hparams.image_min_pixels) {
+        // already spending the minimum budget, so shrink only, never upscale to fill the canvas
+        scale = std::min(1.0, scale);
+    }
+
+    geometry geo;
+    geo.canvas  = canvas;
+    geo.content = {
+        std::max(1, std::min(canvas.width,  (int) std::floor(width  * scale))),
+        std::max(1, std::min(canvas.height, (int) std::floor(height * scale))),
+    };
+    return geo;
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_glm5next::preprocess(const clip_image_u8 & img) const {
+    const geometry geo = get_geometry(hparams, img.get_size());
+
+    clip_image_u8 content;
+    img_tool::resize(img, content, geo.content, hparams.image_resize_algo, PAD_NONE);
+
+    // the reference pads bottom/right, not centred like img_tool::resize would
+    clip_image_u8 canvas;
+    canvas.set_size(geo.canvas, img.is_placeholder());
+    if (!img.is_placeholder()) {
+        img_tool::fill(canvas, hparams.image_pad_color);
+        img_tool::composite(canvas, content, 0, 0);
+    }
+
+    mtmd_image_preproc_out output;
+    output.append(hparams, canvas, true);
     return output;
 }

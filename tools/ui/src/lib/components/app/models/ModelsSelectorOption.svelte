@@ -12,7 +12,7 @@
 	} from '@lucide/svelte';
 	import { ActionIcon, ModelId } from '$lib/components/app';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
-	import { ModelCapability, ServerModelStatus } from '$lib/enums';
+	import { ServerModelStatus } from '$lib/enums';
 	import { modelsStore } from '$lib/stores';
 	import type { ModelOption } from '$lib/types/models';
 	import { modelLoadFraction, modelLoadProgressText } from '$lib/utils';
@@ -60,8 +60,7 @@
 	let loadTitle = $derived(modelLoadProgressText(loadProgress));
 	let modalities = $derived(option.modalities);
 	let capabilities = $derived.by(() => ({
-		reasoning: modelsStore.props.checkModelSupportsThinking(option.model),
-		tools: option.capabilities.includes(ModelCapability.TOOL_USE)
+		reasoning: modelsStore.props.checkModelSupportsThinking(option.model)
 	}));
 </script>
 
@@ -86,13 +85,12 @@
 >
 	<ModelId
 		aliases={option.aliases}
+		{capabilities}
 		class="flex-1"
 		{hideOrgName}
 		{modalities}
 		modelId={option.model}
 		showRawTooltip
-		supportsThinking={capabilities.reasoning}
-		supportsToolUse={capabilities.tools}
 		tags={option.tags}
 	/>
 

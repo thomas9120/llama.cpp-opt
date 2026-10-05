@@ -15,9 +15,8 @@
 		size?: ButtonSize;
 		stopPropagationOnClick?: boolean;
 		tooltip?: string;
-		tooltipAsTitle?: boolean;
-		tooltipSide?: TooltipSide;
 		variant?: ButtonVariant;
+		tooltipSide?: TooltipSide;
 	}
 
 	let {
@@ -31,13 +30,12 @@
 		size = 'sm',
 		stopPropagationOnClick = false,
 		tooltip,
-		tooltipAsTitle = false,
 		tooltipSide = TooltipSide.TOP,
 		variant = 'ghost'
 	}: Props = $props();
 
 	let innerWidth = $state(0);
-	const showTooltip = $derived(!!tooltip && !tooltipAsTitle && innerWidth > 768);
+	const showTooltip = $derived(!!tooltip && innerWidth > 768);
 </script>
 
 {#snippet button(props = {})}
@@ -53,7 +51,6 @@
 			onclick?.(e);
 		}}
 		{size}
-		title={tooltipAsTitle ? tooltip : undefined}
 		{variant}
 	>
 		{#if icon}

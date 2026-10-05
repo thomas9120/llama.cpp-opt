@@ -16,7 +16,7 @@ import {
 } from '$lib/constants';
 import type { ToolExecutionResult } from '$lib/types';
 
-export function detectOs(userAgent: string): string {
+function detectOs(userAgent: string): string {
 	for (const [pattern, os] of BROWSER_INFO_OS_UA_PATTERNS) {
 		if (pattern.test(userAgent)) return os;
 	}

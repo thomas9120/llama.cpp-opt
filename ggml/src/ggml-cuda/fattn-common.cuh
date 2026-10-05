@@ -18,6 +18,185 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Native loaders keep the F16 staging arithmetic and read the original cache strides.
+static inline int ggml_cuda_fattn_native_type(const int device, const ggml_tensor * t) {
+#ifdef GGML_USE_HIP
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_KV_NATIVE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (enabled && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) &&
+            t->ne[0] % 32 == 0 && t->nb[0] == ggml_type_size(t->type)) {
+        switch (t->type) {
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+                return t->type;
+            default: break;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(device, t);
+#endif
+    return GGML_TYPE_F16;
+}
+
+struct fattn_kv_native_t {
+    const char * K;
+    const char * V;
+    int stride_K;
+    int stride_V;
+    int type_K;
+    int type_V;
+};
+
+#if defined(RDNA3_5)
+#define GGML_CUDA_FA_Q8_CHUNK 8
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q8_0_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q8_0) == QK8_0 + 2, "bad block_q8_0");
+
+    const int blk = el / QK8_0;
+    const int off = el % QK8_0;
+    const char * bp = row + (size_t) blk*sizeof(block_q8_0);
+    half d;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d, bp);
+    const half2 d2 = __half2half2(d);
+
+    int8_t q[GGML_CUDA_FA_Q8_CHUNK];
+    ggml_cuda_memcpy_1<GGML_CUDA_FA_Q8_CHUNK, 2>(q, bp + sizeof(half) + off);
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        dst[l] = d2 * make_half2(q[2*l + 0], q[2*l + 1]);
+    }
+}
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q4_0_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q4_0) == QK4_0/2 + 2, "bad block_q4_0");
+
+    const int blk = el / QK4_0;
+    const int off = el % QK4_0;
+    const char * bp = row + (size_t) blk*sizeof(block_q4_0);
+
+    half d_h;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d_h, bp);
+    const float d  = __half2float(d_h);
+    const float dm = -8.0f*d;
+    const int lo   = off < QK4_0/2;
+    const int base = lo ? off : off - QK4_0/2;
+    const uint8_t * qs = (const uint8_t *) (bp + sizeof(half));
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        const uint8_t b0 = qs[base + 2*l + 0];
+        const uint8_t b1 = qs[base + 2*l + 1];
+        const float v0 = d * (lo ? (b0 & 0x0F) : (b0 >> 4)) + dm;
+        const float v1 = d * (lo ? (b1 & 0x0F) : (b1 >> 4)) + dm;
+        dst[l] = make_half2(__float2half(v0), __float2half(v1));
+    }
+}
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q4_1_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q4_1) == 2*sizeof(half) + QK4_1/2, "bad block_q4_1");
+
+    const int blk = el / QK4_1;
+    const int off = el % QK4_1;
+    const char * bp = row + (size_t) blk*sizeof(block_q4_1);
+
+    half d_h, m_h;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d_h, bp);
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&m_h, bp + sizeof(half));
+    const float d = __half2float(d_h);
+    const float m = __half2float(m_h);
+    const int lo   = off < QK4_1/2;
+    const int base = lo ? off : off - QK4_1/2;
+    const uint8_t * qs = (const uint8_t *) (bp + 2*sizeof(half));
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        const uint8_t b0 = qs[base + 2*l + 0];
+        const uint8_t b1 = qs[base + 2*l + 1];
+        const float v0 = d * (lo ? (b0 & 0x0F) : (b0 >> 4)) + m;
+        const float v1 = d * (lo ? (b1 & 0x0F) : (b1 >> 4)) + m;
+        dst[l] = make_half2(__float2half(v0), __float2half(v1));
+    }
+}
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q5_0_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q5_0) == sizeof(half) + sizeof(uint32_t) + QK5_0/2, "bad block_q5_0");
+
+    const int blk = el / QK5_0;
+    const int off = el % QK5_0;
+    const char * bp = row + (size_t) blk*sizeof(block_q5_0);
+
+    half d_h;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d_h, bp);
+    const float d = __half2float(d_h);
+
+    uint32_t qh;
+    ggml_cuda_memcpy_1<sizeof(uint32_t), 2>(&qh, bp + sizeof(half));
+
+    const int lo   = off < QK5_0/2;
+    const int base = lo ? off : off - QK5_0/2;
+    const uint8_t * qs = (const uint8_t *) (bp + sizeof(half) + sizeof(uint32_t));
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        const uint8_t b0 = qs[base + 2*l + 0];
+        const uint8_t b1 = qs[base + 2*l + 1];
+        const float f0 = (float) ((lo ? (b0 & 0x0F) : (b0 >> 4)) | (((qh >> (off + 2*l + 0)) & 1) << 4));
+        const float f1 = (float) ((lo ? (b1 & 0x0F) : (b1 >> 4)) | (((qh >> (off + 2*l + 1)) & 1) << 4));
+        dst[l] = make_half2(__float2half((f0 - 16.0f) * d), __float2half((f1 - 16.0f) * d));
+    }
+}
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q5_1_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q5_1) == 2*sizeof(half) + sizeof(uint32_t) + QK5_1/2, "bad block_q5_1");
+
+    const int blk = el / QK5_1;
+    const int off = el % QK5_1;
+    const char * bp = row + (size_t) blk*sizeof(block_q5_1);
+
+    half d_h, m_h;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d_h, bp);
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&m_h, bp + sizeof(half));
+    const float d = __half2float(d_h);
+    const float m = __half2float(m_h);
+
+    uint32_t qh;
+    ggml_cuda_memcpy_1<sizeof(uint32_t), 2>(&qh, bp + 2*sizeof(half));
+
+    const int lo   = off < QK5_1/2;
+    const int base = lo ? off : off - QK5_1/2;
+    const uint8_t * qs = (const uint8_t *) (bp + 2*sizeof(half) + sizeof(uint32_t));
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        const uint8_t b0 = qs[base + 2*l + 0];
+        const uint8_t b1 = qs[base + 2*l + 1];
+        const float f0 = (float) ((lo ? (b0 & 0x0F) : (b0 >> 4)) | (((qh >> (off + 2*l + 0)) & 1) << 4));
+        const float f1 = (float) ((lo ? (b1 & 0x0F) : (b1 >> 4)) | (((qh >> (off + 2*l + 1)) & 1) << 4));
+        dst[l] = make_half2(__float2half(f0 * d + m), __float2half(f1 * d + m));
+    }
+}
+
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_chunk(
+        const char * row, int el, half2 * dst, int type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0: ggml_cuda_fattn_dequantize_q8_0_chunk(row, el, dst); break;
+        case GGML_TYPE_Q4_0: ggml_cuda_fattn_dequantize_q4_0_chunk(row, el, dst); break;
+        case GGML_TYPE_Q4_1: ggml_cuda_fattn_dequantize_q4_1_chunk(row, el, dst); break;
+        case GGML_TYPE_Q5_0: ggml_cuda_fattn_dequantize_q5_0_chunk(row, el, dst); break;
+        case GGML_TYPE_Q5_1: ggml_cuda_fattn_dequantize_q5_1_chunk(row, el, dst); break;
+        default: NO_DEVICE_CODE; break;
+    }
+}
+#undef GGML_CUDA_FA_Q8_CHUNK
+#endif
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -39,7 +218,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33, const int native_K, const int native_V);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -416,14 +595,9 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
-#if defined(GGML_USE_HIP)
-    // Keep this VMEM read close to its packed-byte dequantization. Hoisting it too far
-    // increases VGPR pressure substantially in some FlashAttention vector kernels.
-    __builtin_amdgcn_sched_group_barrier(0x20, 1, 0);
-#endif // defined(GGML_USE_HIP)
     q >>= 4*shift;
     q &= 0x0F0F0F0F;
-    q = __vsub4(q, 0x08080808);
+    q = __vsubss4(q, 0x08080808);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -513,7 +687,7 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
         }
     }
 
-    q = __vsub4(q, 0x10101010);
+    q = __vsubss4(q, 0x10101010);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -981,7 +1155,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool native_kv = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1011,8 +1185,12 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    const int native_K = native_kv ? ggml_cuda_fattn_native_type(id, K) : GGML_TYPE_F16;
+    const int native_V = native_kv ? ggml_cuda_fattn_native_type(id, V) : GGML_TYPE_F16;
+    const bool stage_K = need_f16_K && native_K == GGML_TYPE_F16;
+    const bool stage_V = need_f16_V && native_V == GGML_TYPE_F16;
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, stage_K, stage_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1028,7 +1206,7 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (stage_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1056,7 +1234,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (stage_V && V->type != GGML_TYPE_F16) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1114,8 +1292,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-    if (scan_mask) {
+    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1143,16 +1320,10 @@ void launch_fattn(
 
     dim3 blocks_num;
     if (stream_k) {
-        // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
-        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
-
-        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+        auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-            if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
-                return false;
-            }
             if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                 return true;
             }
@@ -1195,10 +1366,12 @@ void launch_fattn(
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
+        const int ntiles_dst_eff = ggml_cuda_consistent_decode(cc) && Q->ne[1] <= 8
+            ? ntiles_z_gqa*K->ne[2]*Q->ne[3] : ntiles_dst;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
+            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
@@ -1211,6 +1384,13 @@ void launch_fattn(
                 nwaves_best = nwaves;
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
+            }
+        }
+
+        if constexpr (ncols2 == 3) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                // cap split-KV fan-out, each extra block adds a partial buffer plus merge work
+                parallel_blocks = std::min(18, ntiles_KV);
             }
         }
 
@@ -1261,7 +1441,7 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0, native_K, native_V
     );
     CUDA_CHECK(cudaGetLastError());
 

@@ -34,15 +34,13 @@ extern "C" {
     // Backend buffer type
     //
 
-    GGML_API const char *          ggml_backend_buft_name            (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer    (ggml_backend_buffer_type_t buft, size_t size);
-    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
-    GGML_API size_t                ggml_backend_buft_get_alignment   (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
-    GGML_API size_t                ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
-    GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
+    GGML_API const char *          ggml_backend_buft_name          (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer  (ggml_backend_buffer_type_t buft, size_t size);
+    GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_max_size  (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
 
     //
     // Backend buffer
@@ -96,6 +94,8 @@ extern "C" {
     GGML_API void ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
+
+    GGML_API void ggml_backend_tensor_set_direct(struct ggml_tensor * tensor, size_t offset, size_t size);
 
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
 
@@ -265,46 +265,7 @@ extern "C" {
     // Backend scheduler
     //
 
-    // The backend scheduler allows for multiple backend devices to be used together
-    // Handles compute buffer allocation, assignment of tensors to backends, and copying of tensors between backends
-    // The backends are selected based on:
-    // - the backend that supports the operation
-    // - the location of the pre-allocated tensors (e.g. the weights)
-    /*
-      Example usage:
-
-        // operations that use tensors allocated in a buffer with USAGE_WEIGHTS will be assigned
-        // preferably to run on the same backend as the buffer
-        ggml_backend_buffer_set_usage(buf_weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-        sched = ggml_backend_sched_new({backend_gpu, backend_gpu2, backend_cpu}, NULL, num_backends, GGML_DEFAULT_GRAPH_SIZE, false, true);
-
-        // initialize buffers from a max size graph (optional)
-        reserve_graph = build_graph(sched, max_batch_size);
-
-        // manually assign nodes to a backend (optional, should not be needed in most cases)
-        struct ggml_tensor * node = ggml_mul_mat(ctx, ...);
-        ggml_backend_sched_set_tensor_backend(sched, node, backend_gpu);
-
-        ggml_backend_sched_reserve(sched, reserve_graph);
-
-        // compute
-        graph = build_graph(sched); // the graph and its tensors are single-use in terms of allocation, multi-use in terms of computation
-        for (int i = 0; i < 10; ++i) {
-            ggml_backend_sched_graph_compute(sched, graph); // on the first iteration the graph is allocated automatically
-        }
-
-        // if there are graph inputs:
-        graph = build_graph(sched); // get a new graph that is not allocated (the metadata for the old graph is freed once ggml_free is called)
-        ggml_backend_sched_reset(sched); // clear the allocation of the previous graph
-        ggml_backend_sched_alloc_graph(sched, graph); // explicitly allocate the new graph but do not execute it
-        ggml_backend_tensor_set(input_tensor, ...); // copy data to the newly allocated graph tensors
-        ggml_backend_sched_graph_compute(sched, graph); // execute the graph
-
-        // as an alternative to the above it is also possible to assign the inputs to a dedicated context and
-        // allocate them statically via ggml_backend_alloc_ctx_tensors
-    }
-    */
+    // see docs/development/backend-scheduler.md
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
@@ -343,6 +304,7 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    GGML_API void                 ggml_backend_sched_prepare_inputs(ggml_backend_sched_t sched);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
@@ -385,7 +347,6 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
-        //     (this usually happens when multiple tensors are fused into a single one)
         //   - ne has one entry per segment and device and that segment repeats nr times,
         //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
         //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],

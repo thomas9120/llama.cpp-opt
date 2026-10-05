@@ -694,7 +694,6 @@ struct mtmd_context {
             case PROJECTOR_TYPE_QWEN2VL:
             case PROJECTOR_TYPE_QWEN25VL:
             case PROJECTOR_TYPE_QWEN3VL:
-            case PROJECTOR_TYPE_LING3VL:
             case PROJECTOR_TYPE_MIMOVL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
@@ -868,12 +867,12 @@ struct mtmd_context {
                     img_end = "<|end_of_image|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
-            case PROJECTOR_TYPE_GLM5V:
+            case PROJECTOR_TYPE_GLM5NEXT:
                 {
-                    // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
+                    // glm5next spells video with its own token pair, but video is not supported here
                     img_beg = "<|begin_of_image|>";
                     img_end = "<|end_of_image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_glm5v>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_glm5next>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_PADDLEOCR:
                 {
@@ -2182,12 +2181,8 @@ bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk
     }
     switch (proj_type) {
         case PROJECTOR_TYPE_GEMMA4V:
-            {
-                // E2B (n_embd = 1536) and E4B (n_embd = 2560) always use causal
-                // note: use mmproj n_embd, because text model may not be provided (e.g. mtmd_get_memory_usage)
-                const int n_embd = clip_n_mmproj_embd(ctx->ctx_v);
-                return n_embd != 1536 && n_embd != 2560;
-            }
+            // E2B (n_embd = 1536) and E4B (n_embd = 2560) always use causal
+            return ctx->n_embd_text != 1536 && ctx->n_embd_text != 2560;
         case PROJECTOR_TYPE_GEMMA4UV:
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_DEEPSEEK4V:
@@ -2712,8 +2707,8 @@ static void stub_log_callback(enum ggml_log_level, const char *, void *) {
     // do nothing
 }
 
-mtmd_memory_usage mtmd_get_memory_usage(const char * mmproj_fname,
-                                        struct mtmd_context_params ctx_params) {
+std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_fname,
+                                                            struct mtmd_context_params ctx_params) {
     mtmd::context_ptr ctx;
     auto saved_log_callback = g_logger_state.log_callback;
     auto saved_log_user_data = g_logger_state.log_callback_user_data;
@@ -2736,14 +2731,10 @@ mtmd_memory_usage mtmd_get_memory_usage(const char * mmproj_fname,
         if (ctx->ctx_a) {
             merge(ctx->ctx_a);
         }
-        mtmd_memory_usage res;
-        res.backend_mem_usage = std::move(total_mem);
-        res.image_max_tokens  = ctx->ctx_v ? clip_get_image_max_tokens(ctx->ctx_v) : -1;
-        res.use_non_causal    = ctx->ctx_v ? mtmd_decode_use_non_causal(ctx.get(), nullptr) : false;
-        return res;
+        return total_mem;
     } catch (const std::exception & e) {
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
         LOG_ERR("%s: error: %s\n", __func__, e.what());
-        return {{}, -1, false};
+        return {};
     }
 }

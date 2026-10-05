@@ -1,0 +1,94 @@
+name: Release Windows ROCm 10 and Vulkan
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New release tag (for example, halo-windows-v1)'
+        required: true
+        type: string
+      prerelease:
+        description: Mark as a prerelease
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-combined-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  rocm10:
+    uses: ./.github/workflows/release-windows-rocm10.yml
+    with:
+      tag: ${{ inputs.tag }}
+      build_only: true
+
+  vulkan:
+    uses: ./.github/workflows/release-windows-vulkan.yml
+    with:
+      tag: ${{ inputs.tag }}
+      build_only: true
+
+  publish:
+    needs: [rocm10, vulkan]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Download ROCm packages
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-rocm10
+          path: release/rocm10
+
+      - name: Download Vulkan packages
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-vulkan
+          path: release/vulkan
+
+      - name: Publish combined release
+        run: |
+          $Assets = @()
+          foreach ($Backend in @('rocm10', 'vulkan')) {
+            $Zips = @(Get-ChildItem "release/$Backend/*.zip" -File)
+            $Checksums = @(Get-ChildItem "release/$Backend/*.sha256" -File)
+            if ($Zips.Count -ne 1 -or $Checksums.Count -ne 1) {
+              throw "Expected one ZIP and one checksum file for $Backend."
+            }
+            $Hash = (Get-FileHash -LiteralPath $Zips[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $Expected = "$Hash  $($Zips[0].Name)"
+            if ((Get-Content -LiteralPath $Checksums[0].FullName -Raw).Trim() -cne $Expected) {
+              throw "Package checksum mismatch for $Backend."
+            }
+            $Assets += $Zips[0].FullName, $Checksums[0].FullName
+          }
+          $Notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          @(
+            'Windows x64 builds of the Strix Halo fork for ROCm 10.0.0 (gfx1151) and Vulkan (SDK 1.4.350.0).',
+            '',
+            'Choose the ZIP for your backend and extract it into its own directory. Run the tools in bin; do not mix DLLs from the two packages.',
+            '',
+            'ROCm runtime libraries are bundled in the ROCm package; a compatible AMD graphics driver is required. The Vulkan package requires a Vulkan-capable graphics driver. Neither SDK needs to be installed to run the packages.',
+            '',
+            'CI validates source guards and executable startup. GPU inference and perplexity are not tested on the hosted runners.',
+            '',
+            "Source commit: $env:GITHUB_SHA"
+          ) | Set-Content -LiteralPath $Notes -Encoding utf8
+          $ReleaseArgs = @('release', 'create', $env:RELEASE_TAG) + $Assets + @(
+            '--target', $env:GITHUB_SHA, '--title', $env:RELEASE_TAG, '--notes-file', $Notes
+          )
+          if ($env:PRERELEASE -eq 'true') { $ReleaseArgs += '--prerelease' }
+          gh @ReleaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

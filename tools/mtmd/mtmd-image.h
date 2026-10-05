@@ -123,12 +123,6 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
-// GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
-struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_glm5v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
-    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
-};
-
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio
 struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
     mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
@@ -260,4 +254,20 @@ struct mtmd_image_preprocessor_granite : mtmd_image_preprocessor_llava_uhd {
 struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
     mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
+// ref: Glm5NextImageProcessor.{smart_resize,resize}. unlike the Qwen-style smart_resize in
+// mtmd_image_preprocessor_dyn_size, an over-budget image is pasted top-left, not centred
+struct mtmd_image_preprocessor_glm5next : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_glm5next(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+
+    struct geometry {
+        clip_image_size canvas;  // aligned, padded output size
+        clip_image_size content; // resized image, placed at the top-left of the canvas
+    };
+
+    // static so tests can reach it without a clip_ctx
+    static clip_image_size smart_resize(const clip_hparams & hparams, const clip_image_size & size);
+    static geometry        get_geometry(const clip_hparams & hparams, const clip_image_size & size);
 };

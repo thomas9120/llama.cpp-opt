@@ -97,6 +97,7 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
+                llama_batch batch = {};
                 {
                     auto prompt = common_tokenize(ctx.get(), params.prompt, true);
                     if (prompt.empty()) {
@@ -104,8 +105,8 @@ int main(int argc, char ** argv) {
                         failed.store(true);
                         return;
                     }
-                    common_batch batch = common_batch_get_one(ctx.get(), prompt);
-                    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+                    batch = llama_batch_get_one(prompt.data(), prompt.size());
+                    if (llama_decode(ctx.get(), batch)) {
                         LOG_ERR("failed to decode prompt\n");
                         failed.store(true);
                         return;
@@ -116,7 +117,12 @@ int main(int argc, char ** argv) {
                 std::string result = params.prompt;
 
                 for (int i = 0; i < params.n_predict; i++) {
-                    llama_token token = common_sampler_sample(sampler.get(), ctx.get(), -1);
+                    llama_token token;
+                    if (batch.n_tokens > 0) {
+                        token = common_sampler_sample(sampler.get(), ctx.get(), batch.n_tokens - 1);
+                    } else {
+                        token = llama_vocab_bos(vocab);
+                    }
 
                     result += common_token_to_piece(ctx.get(), token);
 
@@ -124,9 +130,9 @@ int main(int argc, char ** argv) {
                         break;
                     }
 
-                    common_batch batch = common_batch_get_one(ctx.get(), &token, 1);
+                    batch = llama_batch_get_one(&token, 1);
 
-                    int ret = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    int ret = llama_decode(ctx.get(), batch);
                     if (ret == 1 && i > 0) {
                         LOG_INF("Context full, stopping generation.\n");
                         break;
