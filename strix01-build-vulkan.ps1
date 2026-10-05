@@ -1,6 +1,6 @@
 # Build strix01 with the Vulkan backend (validates the STRIX01-PR129 small-M port).
 # Run from the repo root:  powershell -ExecutionPolicy Bypass -File .\build-vulkan-strix01.ps1
-# Binaries land in build-strix01-vk\bin\ (llama-server.exe, llama-cli.exe, llama-bench.exe, test-backend-ops.exe).
+# Binaries land in build-strix01-vk\bin\ (llama-server.exe, llama-cli.exe, llama-fit-params.exe, llama-bench.exe, test-backend-ops.exe).
 param(
     [string]$BuildDir = "build-strix01-vk",
     [int]$Jobs = 16,
@@ -22,4 +22,4 @@ cmake -S . -B $BuildDir -G Ninja `
     -DCMAKE_BUILD_TYPE=$Config
 
 cmake --build $BuildDir --config $Config `
-    --target test-backend-ops llama-bench llama-cli llama-server -j $Jobs
+    --target test-backend-ops llama-bench llama-cli llama-fit-params llama-server -j $Jobs
