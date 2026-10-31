@@ -1,3 +1,4 @@
+#include "json-schema-to-grammar.h"
 #include "parsers.h"
 
 // MiniCPM5 format:

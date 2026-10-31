@@ -28,11 +28,20 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
+#include <thread>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -212,8 +221,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_dots3note(params);
         case LLM_ARCH_DEEPSEEK4:
             return new llama_model_deepseek4(params);
-        case LLM_ARCH_DEEPSEEK41:
-            return new llama_model_deepseek41(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -400,7 +407,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
-    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
+    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
@@ -855,13 +862,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {blck_size_perf};
         }
 
-        if (ud->model->arch == LLM_ARCH_STEP35 || ud->model->arch == LLM_ARCH_LAGUNA) {
-            GGML_ASSERT(segments.size() == 1);
-            if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
-                return {hparams.n_head(il) / hparams.n_head_kv(il)};
-            }
-        }
-
         // everything else
         GGML_ASSERT(segments.size() == 1);
         return {1};
@@ -1279,6 +1279,10 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // strixllama: metadata contexts and device buffers of the decode twins (build_decode_twins)
+    std::vector<ggml_context_ptr>        twin_ctxs;
+    std::vector<ggml_backend_buffer_ptr> twin_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1295,6 +1299,209 @@ struct llama_model::impl {
 
     std::vector<float> tensor_split_owned;
 };
+
+// strixllama: process-wide twin table. The graph context has no pointer to its model, so
+// build_lora_mm looks weights up here; entries are removed when their model is destroyed.
+static std::mutex g_decode_twin_mutex;
+static std::unordered_map<const ggml_tensor *, ggml_tensor *> g_decode_twins;
+
+ggml_tensor * llama_decode_twin(const ggml_tensor * w) {
+    std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+    const auto it = g_decode_twins.find(w);
+    return it == g_decode_twins.end() ? nullptr : it->second;
+}
+
+static std::unordered_map<const ggml_tensor *, ggml_tensor *> g_bf16_twins;
+
+ggml_tensor * llama_bf16_twin(const ggml_tensor * w) {
+    std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+    const auto it = g_bf16_twins.find(w);
+    return it == g_bf16_twins.end() ? nullptr : it->second;
+}
+
+int64_t llama_decode_twin_max_tokens() {
+    static const int64_t v = []() {
+        const char * e = getenv("LLAMA_TRUNK_DECODE_MAX_T");
+        return e ? (int64_t) atoll(e) : (int64_t) 8;
+    }();
+    return v;
+}
+
+// strixllama: LLAMA_TRUNK_DECODE_Q6K=1 builds a Q6_K copy of every 2-D Q8_0 weight (the trunk: attention,
+// delta-net, HC projections, shared experts, PLE key/value; token_embd excluded) in a device buffer of
+// its own. The copy is made with the same ggml_quantize_chunk that llama-quantize uses, so it is
+// byte-identical to a --tensor-type-file requant of the same tensors. Decode on this model streams
+// the trunk once per token at the memory-bandwidth wall; Q6_K reads 23% fewer bytes there (measured
+// -9% per token), while prefill keeps the Q8_0 originals, whose MMB path is faster. Costs the size of
+// the copies (2.9 GB on Qwen3.8-Flash-Next) and a few seconds at load.
+void llama_model::build_decode_twins() {
+    const char * e = getenv("LLAMA_TRUNK_DECODE_Q6K");
+    if (e == nullptr || atoi(e) == 0) {
+        return;
+    }
+    const ggml_type ttype = GGML_TYPE_Q6_K;
+    const int64_t t0 = ggml_time_us();
+
+    std::map<ggml_backend_buffer_type_t, std::vector<std::pair<std::string, ggml_tensor *>>> groups;
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t == nullptr || t->type != GGML_TYPE_Q8_0 || !ggml_is_matrix(t) || t->buffer == nullptr) {
+            continue;
+        }
+        if (name == "token_embd.weight" || t->ne[0] % ggml_blck_size(ttype) != 0) {
+            continue;
+        }
+        groups[ggml_backend_buffer_get_type(t->buffer)].emplace_back(name, t);
+    }
+    if (groups.empty()) {
+        LLAMA_LOG_WARN("%s: LLAMA_TRUNK_DECODE_Q6K set but no 2-D Q8_0 weights found\n", __func__);
+        return;
+    }
+
+    size_t n_twins = 0, bytes = 0;
+    const int n_threads = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+    for (auto & [buft, list] : groups) {
+        ggml_init_params ip = { ggml_tensor_overhead() * (list.size() + 1), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to create decode twin context");
+        }
+        pimpl->twin_ctxs.emplace_back(ctx);
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+        for (auto & [name, t] : list) {
+            ggml_tensor * twin = ggml_new_tensor_2d(ctx, ttype, t->ne[0], t->ne[1]);
+            ggml_format_name(twin, "%s.q6k", name.c_str());
+            pairs.emplace_back(t, twin);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("failed to allocate decode twin buffer on %s", ggml_backend_buft_name(buft)));
+        }
+        pimpl->twin_bufs.emplace_back(buf);
+        bytes += ggml_backend_buffer_get_size(buf);
+
+        const auto * q8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        for (auto & [t, twin] : pairs) {
+            const int64_t n_per_row = t->ne[0];
+            const int64_t nrows     = t->ne[1];
+            std::vector<uint8_t> src(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, src.data(), 0, src.size());
+            std::vector<float> f32((size_t) n_per_row * nrows);
+            q8->to_float(src.data(), f32.data(), (int64_t) f32.size());
+            std::vector<uint8_t> dst(ggml_nbytes(twin));
+            const int64_t rows_per_thread = (nrows + n_threads - 1) / n_threads;
+            std::vector<std::thread> workers;
+            for (int w = 0; w < n_threads; ++w) {
+                const int64_t first = w * rows_per_thread;
+                const int64_t count = std::min(rows_per_thread, nrows - first);
+                if (count <= 0) {
+                    break;
+                }
+                workers.emplace_back([&, first, count]() {
+                    ggml_quantize_chunk(ttype, f32.data(), dst.data(), first * n_per_row, count, n_per_row, nullptr);
+                });
+            }
+            for (auto & w : workers) {
+                w.join();
+            }
+            ggml_backend_tensor_set(twin, dst.data(), 0, dst.size());
+            decode_twins[t] = twin;
+            ++n_twins;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : decode_twins) {
+            g_decode_twins[t] = twin;
+        }
+    }
+    LLAMA_LOG_INFO("%s: %zu Q8_0 trunk tensors got %s decode twins (%.2f GiB, %d threads, %.1f s); used for batches of <= %lld tokens\n",
+            __func__, n_twins, ggml_type_name(ttype), bytes / 1024.0 / 1024.0 / 1024.0, n_threads,
+            (ggml_time_us() - t0) / 1e6, (long long) llama_decode_twin_max_tokens());
+}
+
+// strixllama: BF16 twins of the F32 weights whose every value is a bfloat16 - the MoE routers, the shared experts' gates,
+// the delta-net alpha / beta and the hyper-connection injects of Qwen3.8-Flash-Next, 0.31 GB a token as F32. A decode
+// batch (at most 8 tokens) multiplies them with mul_mat_vec_f, whose bf16 loop is its f32 loop and bf16 widens to f32
+// exactly: the same products at half the bytes (router [2560 -> 512] 29 -> 18 us). Prefill keeps the originals and
+// their kernels. Twins carry GGML_BF16_TWIN_MAGIC so the backend keeps them on the vector kernel. STRIX_BF16_TWINS=0: none.
+void llama_model::build_bf16_twins() {
+    const char * e = getenv("STRIX_BF16_TWINS");
+    if (e != nullptr && atoi(e) == 0) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    static const char * const families[] = { "ffn_gate_inp", "ssm_alpha", "ssm_beta", "_inject" };
+
+    std::map<ggml_backend_buffer_type_t, std::vector<std::pair<std::string, ggml_tensor *>>> groups;
+    size_t n_inexact = 0;
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || t->buffer == nullptr || ggml_n_dims(t) > 2 || t->ne[0] % 2 != 0 ||
+                !ggml_is_contiguous(t) || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer))) {
+            continue;
+        }
+        bool family = false;
+        for (const char * f : families) {
+            family = family || name.find(f) != std::string::npos;
+        }
+        if (!family) {
+            continue;
+        }
+        std::vector<uint32_t> bits(ggml_nelements(t));
+        ggml_backend_tensor_get(t, bits.data(), 0, ggml_nbytes(t));
+        bool exact = true;
+        for (const uint32_t u : bits) {
+            exact = exact && (u & 0xffffu) == 0;
+        }
+        if (!exact) {
+            ++n_inexact;
+            continue;
+        }
+        groups[ggml_backend_buffer_get_type(t->buffer)].emplace_back(name, t);
+    }
+
+    size_t n_twins = 0, bytes = 0;
+    for (auto & [buft, list] : groups) {
+        ggml_init_params ip = { ggml_tensor_overhead() * (list.size() + 1), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to create bf16 twin context");
+        }
+        pimpl->twin_ctxs.emplace_back(ctx);
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+        for (auto & [name, t] : list) {
+            ggml_tensor * twin = ggml_new_tensor(ctx, GGML_TYPE_BF16, ggml_n_dims(t), t->ne);
+            ggml_format_name(twin, "%s.bf16", name.c_str());
+            ((int32_t *) twin->op_params)[0] = GGML_BF16_TWIN_MAGIC;
+            pairs.emplace_back(t, twin);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("failed to allocate bf16 twin buffer on %s", ggml_backend_buft_name(buft)));
+        }
+        pimpl->twin_bufs.emplace_back(buf);
+        bytes += ggml_backend_buffer_get_size(buf);
+        for (auto & [t, twin] : pairs) {
+            std::vector<uint32_t> bits(ggml_nelements(t));
+            ggml_backend_tensor_get(t, bits.data(), 0, ggml_nbytes(t));
+            std::vector<uint16_t> half(bits.size());
+            for (size_t k = 0; k < bits.size(); ++k) {
+                half[k] = (uint16_t) (bits[k] >> 16);
+            }
+            ggml_backend_tensor_set(twin, half.data(), 0, ggml_nbytes(twin));
+            bf16_twins[t] = twin;
+            ++n_twins;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : bf16_twins) {
+            g_bf16_twins[t] = twin;
+        }
+    }
+    // stderr: the server's log keeps none of the library's load messages
+    fprintf(stderr, "%s: %zu F32 weights got BF16 twins (%.2f GiB, %.1f s), %zu kept F32 (not all bfloat16); used for batches of <= 8 tokens\n",
+            __func__, n_twins, bytes / 1024.0 / 1024.0 / 1024.0, (ggml_time_us() - t0) / 1e6, n_inexact);
+}
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
     if (!res || !res->src[0]) {
@@ -1359,6 +1566,18 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
+    }
+    if (!decode_twins.empty()) {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : decode_twins) {
+            g_decode_twins.erase(t);
+        }
+    }
+    if (!bf16_twins.empty()) {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : bf16_twins) {
+            g_bf16_twins.erase(t);
+        }
     }
 }
 
@@ -1666,6 +1885,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             splits[i] = free;
         }
+        // every device full by its own count (an iGPU counts pinned host buffers against its memory): the
+        // split points would be 0/0 and every layer would index past the device list, so split evenly
+        if (std::all_of(splits.begin(), splits.end(), [](float x) { return x == 0.0f; })) {
+            std::fill(splits.begin(), splits.end(), 1.0f);
+        }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
     }
@@ -1880,6 +2104,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     ml.done_getting_tensors();
+    waux = std::move(ml.waux);
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
@@ -1909,6 +2134,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // create the backend buffers
     // note: the buffers are owned by pimpl->ctxs_bufs, this is a raw-pointer view used to load the data
     std::vector<std::pair<ggml_context *, std::vector<ggml_backend_buffer_t>>> ctx_bufs;
+    bool mapped_any = false;   // strixllama: a buffer lives on a mapping, so the model keeps them
+    std::vector<ggml_context *> ctx_direct_only;   // strixllama: lazy contexts only direct readers read: nothing to load
     ctx_bufs.reserve(ml.ctx_map.size());
 
     // reserve hint: each context creates one buffer per file, or more when its tensors are spread
@@ -1943,8 +2170,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // strixllama: a lazy context whose every tensor a direct reader reads unbuffered is never read through its
+        // buffer, and the mapping behind one would keep the file's cache map active for the server's life, which
+        // makes every unbuffered read pay for coherency (~8K pages/s against ~500K): such a context gets an empty
+        // placeholder buffer, and with no buffer on them the mappings go with the loader
+        bool lazy_direct_only = is_lazy_mapped && !ml.use_mmap;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); lazy_direct_only && t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const auto it = lazy_readers.find(ggml_get_name(t));
+            lazy_direct_only = it != lazy_readers.end() && it->second && it->second->is_unbuffered();
+        }
+
+        if ((ml.use_mmap || is_lazy_mapped) && !lazy_direct_only && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            mapped_any = true;
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -1966,7 +2204,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (lazy_direct_only) {
+                ctx_direct_only.push_back(ctx);
+            }
+            if (ml.no_alloc || lazy_direct_only) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
@@ -2049,20 +2290,121 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, bufs] : ctx_bufs) {
+        if (std::find(ctx_direct_only.begin(), ctx_direct_only.end(), ctx) != ctx_direct_only.end()) {
+            continue;
+        }
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
 
-    if (use_mmap_buffer) {
+    if (use_mmap_buffer && mapped_any) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
 
+    // strixllama: optional Q6_K decode copies of the Q8_0 trunk (LLAMA_TRUNK_DECODE_Q6K=1)
+    build_decode_twins();
+    // strixllama: BF16 copies of the bfloat16-valued F32 weights for decode batches (STRIX_BF16_TWINS=0: none)
+    build_bf16_twins();
     load_tensors_hadamard();
 
     return true;
+}
+
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
+    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
+        return nullptr;
+    }
+
+    if (!t) {
+        return nullptr;
+    }
+
+    if (const auto it = lazy_readers.find(tensor_name); it != lazy_readers.end()) {
+        return it->second.get();
+    }
+
+    const auto * w = ml.get_weight(tensor_name);
+    if (!w) {
+        // e.g. synthesised from metadata, no file rows to read
+        return nullptr;
+    }
+
+#ifdef _WIN32
+    const std::string & name = ml.files[w->idx]->name();
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.c_str(), -1, nullptr, 0);
+    if (size == 0) {
+        throw std::runtime_error("invalid UTF-8 path for lazy reader");
+    }
+    std::wstring wide(size, L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.c_str(), -1, wide.data(), size)) {
+        throw std::runtime_error("failed to convert lazy reader path");
+    }
+    // strixllama: unbuffered, alone (see llama_lazy_reader::unbuffered); buffered when that cannot be opened
+    const bool want_unbuffered = !getenv("STRIX_PLE_UNBUFFERED") || atoi(getenv("STRIX_PLE_UNBUFFERED")) != 0;
+    HANDLE fd = want_unbuffered ? CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                              FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, nullptr)
+                                : INVALID_HANDLE_VALUE;
+    const bool unbuffered = fd != INVALID_HANDLE_VALUE;
+    if (!unbuffered) {
+        fd = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    }
+    if (fd == INVALID_HANDLE_VALUE) {
+        LLAMA_LOG_WARN("%s: Windows lazy reader open failed (%lu), using lazy mmap reads\n",
+                __func__, (unsigned long) GetLastError());
+        return nullptr;
+    }
+#else
+    // an independently opened buffered descriptor: dup() would share the
+    // loader's open file description, whose readahead advice and O_DIRECT
+    // flag would fight the small scattered row reads
+    const int fd = ::open(ml.files[w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
+                __func__, ml.files[w->idx]->name().c_str(), strerror(errno));
+        return nullptr;
+    }
+
+#ifdef __linux__
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+
+#endif
+
+    // in-flight reads are IO queue depth, not compute; 2x cores worked well
+    // on NVMe and stays sane on smaller machines
+    int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
+    if (const char * e = getenv("LLAMA_LAZY_READ_THREADS")) {   // the gather is NVMe queue-depth bound, not CPU bound
+        const int v = atoi(e);
+        if (v > 0 && v <= 4096) { n_threads = v; }
+    }
+
+    std::unique_ptr<llama_lazy_reader> reader;
+    try {
+#ifdef _WIN32
+        reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
+                ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0], unbuffered);
+#else
+        reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
+                ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+#endif
+    } catch (...) {
+#ifdef _WIN32
+        CloseHandle(fd);
+#else
+        ::close(fd);
+#endif
+        throw;
+    }
+
+    LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
+            __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads);
+
+    lazy_readers[tensor_name] = std::move(reader);
+    return lazy_readers.at(tensor_name).get();
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -2448,14 +2790,10 @@ llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
 
-bool llama_model::no_alloc() const {
-    return params.no_alloc;
-}
-
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
-        if (no_alloc()) {
+        if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
             GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
@@ -2510,7 +2848,7 @@ void llama_model::print_info() const {
     // hparams
     LLAMA_LOG_INFO("%s: arch                  = %s\n",     __func__, arch_name().c_str());
     LLAMA_LOG_INFO("%s: vocab_only            = %d\n",     __func__, hparams.vocab_only);
-    LLAMA_LOG_INFO("%s: no_alloc              = %d\n",     __func__, no_alloc());
+    LLAMA_LOG_INFO("%s: no_alloc              = %d\n",     __func__, hparams.no_alloc);
 
     if (!hparams.vocab_only) {
         LLAMA_LOG_INFO("%s: n_ctx_train           = %u\n",     __func__, hparams.n_ctx_train);
@@ -2834,7 +3172,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 res = new llama_kv_cache_msa(
                         *this,
-                        params.no_alloc,
                         params.type_k,
                         params.type_v,
                         !cparams.flash_attn,
@@ -2861,7 +3198,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache(
                             *this,
-                            params.no_alloc,
                             hparams,
                             params.type_k,
                             params.type_v,
@@ -2888,7 +3224,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_dsa(
                             *this,
-                            params.no_alloc,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2930,7 +3265,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 res = new llama_memory_hybrid_idx(
                     /* model             */ *this,
-                    /* no_alloc          */ params.no_alloc,
                     /* attn_type_k       */ params.type_k,
                     /* attn_type_v       */ params.type_v,
                     /* attn_v_trans      */ !cparams.flash_attn,
@@ -2955,7 +3289,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // full-attention checkpoint: no indexer, so no indexer key cache
                     res = new llama_kv_cache(
                             *this,
-                            params.no_alloc,
                             hparams,
                             params.type_k,
                             params.type_v,
@@ -2977,7 +3310,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_dsa(
                             *this,
-                            params.no_alloc,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -3004,7 +3336,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache(
                             *this,
-                            params.no_alloc,
                             hparams,
                             params.type_k,
                             params.type_v,
@@ -3030,7 +3361,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_dsa_iswa(
                             *this,
-                            params.no_alloc,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -3046,7 +3376,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr);
                 }
             } break;
-        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_DEEPSEEK4:
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
@@ -3058,7 +3387,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_iswa(
                             *this,
-                            params.no_alloc,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -3076,7 +3404,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
-                            params.no_alloc,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -3100,7 +3427,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_iswa(
                             *this,
-                            params.no_alloc,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -3124,10 +3450,46 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // Halogen prefills the qwen4exp draft head with the SAME sparse attention as the trunk (one
+                // k_attn_qs_bt4x call per target chunk for the nextn layer), so with LLAMA_MTP_QSA=1 the MTP context
+                // gets an indexer cache instead of a plain KV cache.
+                static const bool mtp_qsa = getenv("LLAMA_MTP_QSA") && atoi(getenv("LLAMA_MTP_QSA")) != 0;
+
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 ||
+                     (arch == LLM_ARCH_QWEN4EXP && !(mtp_qsa && hparams.indexer_head_size > 0)));
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                        mtp_qsa && hparams.indexer_head_size > 0) {
+                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
+                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
+                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    return new llama_memory_hybrid_idx(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_pad        */ 1,
+                        /* attn_n_swa        */ hparams.n_swa,
+                        /* attn_swa_type     */ hparams.swa_type,
+                        /* recurrent_type_k  */ GGML_TYPE_F32,
+                        /* recurrent_type_v  */ GGML_TYPE_F32,
+                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(f_attn),
+                        /* filter_recr       */ std::move(f_recr),
+                        /* filter_idx        */ std::move(f_idx));
+                }
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -3135,7 +3497,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
-                            params.no_alloc,
                             GGML_TYPE_F32,
                             GGML_TYPE_F32,
                             cparams.offload_kqv,
@@ -3191,7 +3552,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
-                            /* no_alloc          */ params.no_alloc,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
@@ -3212,7 +3572,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
-                            /* no_alloc          */ params.no_alloc,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
@@ -3233,7 +3592,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
-                            /* no_alloc          */ params.no_alloc,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
@@ -3300,7 +3658,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             res = new llama_kv_cache_iswa(
                                     *this,
-                                    params.no_alloc,
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
@@ -3318,7 +3675,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
-                                    params.no_alloc,
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
@@ -3339,7 +3695,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                         res = new llama_kv_cache(
                                 *this,
-                                params.no_alloc,
                                 hparams,
                                 params.type_k,
                                 params.type_v,
@@ -3385,7 +3740,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     return llm->res->get_gf();
 }
-
 
 //
 // interface implementation
@@ -3466,12 +3820,11 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4) {
         return 0;
     }
     return model->hparams.n_swa;
 }
-
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;
@@ -3561,7 +3914,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_PLM:

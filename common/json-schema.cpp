@@ -1,25 +1,16 @@
 #include "json-schema.h"
 #include "common.h"
 
+#include <algorithm>
 #include <cmath>
+#include <functional>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-namespace {
-struct depth_guard {
-    int & depth;
-    depth_guard(int & depth) : depth(depth) {
-        if (++depth > COMMON_RECURSIVE_LIMIT) {
-            throw std::invalid_argument("JSON schema is nested more than " + std::to_string(COMMON_RECURSIVE_LIMIT) + " levels deep");
-        }
-    }
-    ~depth_guard() { depth--; }
-};
-} // namespace
 
 class common_chat_schema_builder {
     const common_json &      root_;
@@ -236,14 +227,7 @@ class common_chat_schema_builder {
         return node;
     }
 
-    int depth_ = 0;
-
     common_chat_schema_ptr build_node(const common_json & schema, const std::string & path) {
-        depth_guard guard(depth_);
-        return build_node_impl(schema, path);
-    }
-
-    common_chat_schema_ptr build_node_impl(const common_json & schema, const std::string & path) {
         if (!schema.is_object()) {
             fail(path, "schema must be an object");
         }
@@ -356,9 +340,211 @@ class common_chat_schema_builder {
     }
 };
 
+// strixllama: allOf merged into one schema before the document is built, the way the converter merged it in 0.5.2-0.6.4
+// (Rulith's tool schemas): an allOf over a non-object type (an array $ref plus minItems) merges its keywords instead of
+// becoming an object with no properties; a part's properties are required only as its own "required" list says; a
+// {not: {required: [...]}} part leaves those properties out; oneOf / anyOf parts offer their properties as optional;
+// a nested allOf contributes its parts. Only same-document references are followed, as the builder does.
+static common_json strix_merge_all_of(const common_json & root) {
+    auto resolve = [&](const common_json & s0) -> common_json {
+        common_json s = s0;
+        for (int depth = 0; depth < 16 && s.is_object() && s.contains("$ref") && s.at("$ref").is_string(); ++depth) {
+            const std::string ref = s.at("$ref").get<std::string>();
+            if (ref.rfind("#/", 0) != 0) {
+                break;
+            }
+            const common_json * cur = &root;
+            size_t pos = 2;
+            while (cur && pos <= ref.size()) {
+                const size_t next = std::min(ref.find('/', pos), ref.size());
+                const std::string key = ref.substr(pos, next - pos);
+                cur = cur->is_object() && cur->contains(key) ? &cur->at(key) : nullptr;
+                pos = next + 1;
+            }
+            if (!cur) {
+                break;
+            }
+            s = *cur;
+        }
+        return s;
+    };
+    // the keywords whose values are schemas (or objects / arrays of schemas); enum, const, default and the like are data
+    static const std::unordered_set<std::string> schema_maps  = {"properties", "$defs", "definitions", "patternProperties", "dependentSchemas"};
+    static const std::unordered_set<std::string> schema_lists = {"oneOf", "anyOf", "prefixItems"};
+    static const std::unordered_set<std::string> schema_ones  = {"items", "additionalProperties", "not", "contains", "if", "then", "else"};
+
+    std::function<common_json(const common_json &, int)> norm = [&](const common_json & s, int depth) -> common_json {
+        if (!s.is_object() || depth > 64) {
+            return s;
+        }
+        common_json out = common_json::object();
+        for (const auto & [k, v] : s.items()) {
+            if (k == "allOf") {
+                continue;
+            }
+            if (schema_maps.count(k) && v.is_object()) {
+                common_json m = common_json::object();
+                for (const auto & [name, sub] : v.items()) {
+                    m[name] = norm(sub, depth + 1);
+                }
+                out[k] = m;
+            } else if ((schema_lists.count(k) || k == "items") && v.is_array()) {
+                common_json a = common_json::array();
+                for (const auto & sub : v) {
+                    a.push_back(norm(sub, depth + 1));
+                }
+                out[k] = a;
+            } else if (schema_ones.count(k)) {
+                out[k] = norm(v, depth + 1);
+            } else {
+                out[k] = v;
+            }
+        }
+        // the builder takes $ref and alternatives before allOf, and so did the converter: those stay as they are
+        if (!s.contains("allOf") || !s.at("allOf").is_array() || s.contains("$ref") || s.contains("oneOf") || s.contains("anyOf")) {
+            if (s.contains("allOf")) {
+                out["allOf"] = s.at("allOf");
+            }
+            return out;
+        }
+        const common_json & parts = s.at("allOf");
+
+        // a non-object allOf: the keywords of every part merged into one schema
+        bool objecty = s.contains("properties") || (s.contains("type") && s.at("type") == "object");
+        for (const auto & p0 : parts) {
+            const common_json p = resolve(p0);
+            if (p.is_object() && (p.contains("properties") || p.contains("oneOf") || p.contains("anyOf") ||
+                                  p.contains("enum") || p.contains("const") || (p.contains("type") && p.at("type") == "object"))) {
+                objecty = true;
+            }
+        }
+        if (!objecty) {
+            common_json merged = out;
+            std::function<void(common_json &, const common_json &)> merge = [&](common_json & dst, const common_json & src) {
+                for (const auto & [k, v] : src.items()) {
+                    if (k == "required" && dst.contains(k) && dst.at(k).is_array() && v.is_array()) {
+                        for (const auto & r : v) {
+                            dst[k].push_back(r);
+                        }
+                    } else if (dst.contains(k) && dst.at(k).is_object() && v.is_object()) {
+                        merge(dst[k], v);
+                    } else {
+                        dst[k] = v;
+                    }
+                }
+            };
+            for (const auto & p0 : parts) {
+                const common_json p = resolve(p0);
+                if (p.is_object()) {
+                    merge(merged, p);
+                }
+            }
+            merged.erase("allOf");
+            if (!(merged.contains("type") && merged.at("type") == "object")) {
+                return norm(merged, depth + 1);
+            }
+        }
+
+        // an object allOf: the parts' properties, each required as its part says
+        std::vector<std::string>           order;
+        std::map<std::string, common_json> props;
+        std::set<std::string>              required, forbidden;
+        std::map<std::string, size_t>      enum_count;
+        std::map<std::string, common_json> enum_value;
+        size_t                             n_parts = 0;
+        std::function<void(const common_json &, bool)> add_component = [&](const common_json & c0, bool is_required) {
+            const common_json c = resolve(c0);
+            if (!c.is_object()) {
+                return;
+            }
+            if (c.contains("properties") && c.at("properties").is_object()) {
+                for (const auto & [k, v] : c.at("properties").items()) {
+                    if (props.find(k) == props.end()) {
+                        order.push_back(k);
+                        props[k] = v;
+                    }
+                }
+                if (is_required && c.contains("required") && c.at("required").is_array()) {
+                    for (const auto & r : c.at("required")) {
+                        if (r.is_string()) {
+                            required.insert(r.get<std::string>());
+                        }
+                    }
+                }
+            } else if (c.contains("not") && c.at("not").is_object() && c.at("not").size() == 1 &&
+                       c.at("not").contains("required") && c.at("not").at("required").is_array()) {
+                for (const auto & r : c.at("not").at("required")) {
+                    if (r.is_string()) {
+                        forbidden.insert(r.get<std::string>());
+                    }
+                }
+            } else if (c.contains("enum") && c.at("enum").is_array()) {
+                for (const auto & v : c.at("enum")) {
+                    const std::string key = v.dump();
+                    enum_count[key] += 1;
+                    enum_value[key] = v;
+                }
+            }
+        };
+        std::function<void(const common_json &, int)> add_part = [&](const common_json & t, int d) {
+            const common_json r = resolve(t);
+            if (d < 8 && r.is_object() && r.contains("allOf") && r.at("allOf").is_array() && !r.contains("properties")) {
+                for (const auto & tt : r.at("allOf")) {
+                    add_part(tt, d + 1);
+                }
+            } else if (r.is_object() && (r.contains("anyOf") || r.contains("oneOf"))) {
+                const common_json & alts = r.contains("anyOf") ? r.at("anyOf") : r.at("oneOf");
+                if (alts.is_array()) {
+                    for (const auto & tt : alts) {
+                        add_component(tt, false);
+                    }
+                }
+            } else {
+                add_component(t, true);
+            }
+        };
+        if (s.contains("properties")) {
+            add_component(s, true);
+        }
+        for (const auto & t : parts) {
+            ++n_parts;
+            add_part(t, 0);
+        }
+        if (!enum_count.empty()) {
+            common_json values = common_json::array();
+            for (const auto & [key, n] : enum_count) {
+                if (n == n_parts) {
+                    values.push_back(enum_value[key]);
+                }
+            }
+            if (!values.empty()) {
+                return common_json{{"enum", values}};
+            }
+        }
+        common_json merged = out;
+        common_json p = common_json::object();
+        common_json r = common_json::array();
+        for (const auto & k : order) {
+            if (forbidden.count(k)) {
+                continue;
+            }
+            p[k] = props[k];
+            if (required.count(k)) {
+                r.push_back(k);
+            }
+        }
+        merged["type"]       = "object";
+        merged["properties"] = p;
+        merged["required"]   = r;
+        return norm(merged, depth + 1);
+    };
+    return norm(root, 0);
+}
+
 common_chat_schema_document common_chat_schema_from_json(const common_json & schema) {
     common_chat_schema_document doc;
-    doc.root = common_chat_schema_builder(schema, doc).build();
+    const common_json merged = strix_merge_all_of(schema);
+    doc.root = common_chat_schema_builder(merged, doc).build();
     return doc;
 }
 
@@ -384,9 +570,7 @@ static common_chat_schema::value_type json_type(const common_json & value) {
     return common_chat_schema::TYPE_OBJECT;
 }
 
-// depth counts the $ref, anyOf and allOf hops, a $ref chain is not bounded by the builder
-static common_chat_schema::type_set value_types_impl(const common_chat_schema & s, std::unordered_set<const common_chat_schema *> & visited, int & depth) {
-    depth_guard guard(depth);
+static common_chat_schema::type_set value_types_impl(const common_chat_schema & s, std::unordered_set<const common_chat_schema *> & visited) {
     switch (s.kind()) {
         case common_chat_schema::KIND_ANY:
             return common_chat_schema::type_set::all();
@@ -420,21 +604,21 @@ static common_chat_schema::type_set value_types_impl(const common_chat_schema & 
                 // a cycle contributes no type, to be safe
                 return {};
             }
-            auto types = value_types_impl(*target, visited, depth);
+            auto types = value_types_impl(*target, visited);
             visited.erase(target);
             return types;
         }
         case common_chat_schema::KIND_ANY_OF: {
             common_chat_schema::type_set types;
             for (const auto & child : static_cast<const common_chat_schema_any_of &>(s).children) {
-                types |= value_types_impl(*child, visited, depth);
+                types |= value_types_impl(*child, visited);
             }
             return types;
         }
         case common_chat_schema::KIND_ALL_OF: {
             auto types = common_chat_schema::type_set::all();
             for (const auto & child : static_cast<const common_chat_schema_all_of &>(s).children) {
-                types &= value_types_impl(*child, visited, depth);
+                types &= value_types_impl(*child, visited);
             }
             return types;
         }
@@ -444,12 +628,10 @@ static common_chat_schema::type_set value_types_impl(const common_chat_schema & 
 
 common_chat_schema::type_set common_chat_schema::value_types() const {
     std::unordered_set<const common_chat_schema *> visited;
-    int depth = 0;
-    return value_types_impl(*this, visited, depth);
+    return value_types_impl(*this, visited);
 }
 
-static bool may_be_string_impl(const common_chat_schema & s, std::unordered_set<const common_chat_schema *> & visited, int & depth) {
-    depth_guard guard(depth);
+static bool may_be_string_impl(const common_chat_schema & s, std::unordered_set<const common_chat_schema *> & visited) {
     switch (s.kind()) {
         case common_chat_schema::KIND_STRING:
             return true;
@@ -468,13 +650,13 @@ static bool may_be_string_impl(const common_chat_schema & s, std::unordered_set<
             if (!target || !visited.insert(target).second) {
                 return false;
             }
-            bool result = may_be_string_impl(*target, visited, depth);
+            bool result = may_be_string_impl(*target, visited);
             visited.erase(target);
             return result;
         }
         case common_chat_schema::KIND_ANY_OF:
             for (const auto & child : static_cast<const common_chat_schema_any_of &>(s).children) {
-                if (may_be_string_impl(*child, visited, depth)) {
+                if (may_be_string_impl(*child, visited)) {
                     return true;
                 }
             }
@@ -486,7 +668,7 @@ static bool may_be_string_impl(const common_chat_schema & s, std::unordered_set<
                 if (child->kind() == common_chat_schema::KIND_ANY) {
                     continue;
                 }
-                if (!may_be_string_impl(*child, visited, depth)) {
+                if (!may_be_string_impl(*child, visited)) {
                     return false;
                 }
                 any_string = true;
@@ -500,8 +682,7 @@ static bool may_be_string_impl(const common_chat_schema & s, std::unordered_set<
 
 bool common_chat_schema::may_be_string() const {
     std::unordered_set<const common_chat_schema *> visited;
-    int depth = 0;
-    return may_be_string_impl(*this, visited, depth);
+    return may_be_string_impl(*this, visited);
 }
 
 const char * common_chat_schema::kind_name(node_kind kind) {

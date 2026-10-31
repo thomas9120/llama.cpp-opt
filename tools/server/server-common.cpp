@@ -16,9 +16,7 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
-#include <atomic>
 #include <chrono>
-#include <iostream>
 #include <thread>
 
 #ifdef _WIN32
@@ -1429,7 +1427,63 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("Expected 'content' to be a string or an array");
         }
 
+        // strixllama: an image in a tool's output (a /v1/responses input_image part, an Anthropic tool_result image) on
+        // a server without image input is described instead of failing the request
+        if (role == "tool" && !opt.allow_image) {
+            for (auto & p : content) {
+                if (json_value(p, "type", std::string()) == "image_url") {
+                    SRV_WRN("%s", "an image in a tool output is not supported without image input; the model is told it was left out\n");
+                    p = json { {"text", "[image left out]"}, {"type", "text"} };
+                }
+            }
+        }
+
         oaicompat_content_load_media(content, opt, out_files);
+    }
+
+    // strixllama: a system or developer message after the conversation started (coding agents such as Codex send
+    // developer messages between turns) made templates that allow them only at the start raise "System message must be
+    // at the beginning." and the request fail with HTTP 500. With such a template it is passed on as a user message
+    // saying whose it is; the leading system and developer messages stay as they are.
+    if (opt.use_jinja && opt.tmpls) {
+        bool started = false;
+        bool late    = false;
+        for (const auto & msg : messages) {
+            const std::string role = json_value(msg, "role", std::string());
+            if (role != "system" && role != "developer") {
+                started = true;
+            } else if (started) {
+                late = true;
+                break;
+            }
+        }
+        if (late && (common_chat_templates_source(opt.tmpls.get()).find("must be at the beginning") != std::string::npos ||
+                     common_chat_templates_source(opt.tmpls.get(), "tool_use").find("must be at the beginning") != std::string::npos)) {
+            started = false;
+            for (auto & msg : messages) {
+                const std::string role = json_value(msg, "role", std::string());
+                if (role != "system" && role != "developer") {
+                    started = true;
+                    continue;
+                }
+                if (!started) {
+                    continue;
+                }
+                const std::string label = "[" + role + " message]\n";
+                msg["role"] = "user";
+                json & content = msg["content"];
+                if (content.is_string()) {
+                    content = label + content.get<std::string>();
+                } else if (content.is_array()) {
+                    json parts = json::array();
+                    parts.push_back(json { {"type", "text"}, {"text", label} });
+                    parts.insert(content);
+                    content = parts;
+                } else {
+                    content = label;
+                }
+            }
+        }
     }
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
@@ -1494,9 +1548,19 @@ json oaicompat_chat_params_parse(
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        // strixllama (issue #17): the ends of other APIs' scales, which templates reject with an exception (HTTP 500),
+        // become the ends every template with levels has
+        if (reasoning_effort == "minimal") {
+            reasoning_effort = "low";
+        } else if (reasoning_effort == "max") {
+            reasoning_effort = "high";
+        }
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
             inputs.chat_template_kwargs.erase("reasoning_effort");
+            // strixllama (issue #17): the template reads the kwarg too, and --reasoning on (or a default
+            // enable_thinking kwarg) set it to true: the request thought, at the template's default level
+            inputs.chat_template_kwargs["enable_thinking"] = "false";
         } else if (!reasoning_effort.empty()) {
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
@@ -1507,7 +1571,54 @@ json oaicompat_chat_params_parse(
     // Apply chat template to the list of messages
     common_chat_session_params session_params;
     session_params.echo = json_value(body, "echo", false);
-    out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+    // strixllama (issue #17): what a template refuses (raise_exception on a value it does not take) is the request's
+    // to fix - HTTP 400, not a server error
+    try {
+        out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+    } catch (const std::invalid_argument &) {
+        throw;
+    } catch (const std::exception & e) {
+        // strixllama (issue #12): templates that take one system message, first (the original Qwen3.8 template, its
+        // fine-tunes), refused two at the start - /v1/responses' instructions followed by a developer message - with
+        // "System message must be at the beginning.": the leading ones become one system message, and the request is
+        // rendered again. Only a request that failed takes this path
+        size_t n_lead = 0;
+        while (n_lead < inputs.messages.size() &&
+               (inputs.messages[n_lead].role == "system" || inputs.messages[n_lead].role == "developer")) {
+            n_lead++;
+        }
+        if (n_lead < 2 || std::string(e.what()).find("must be at the beginning") == std::string::npos) {
+            throw std::invalid_argument(std::string("the chat template refused the request: ") + e.what());
+        }
+        common_chat_msg merged;
+        merged.role = "system";
+        bool parts = false;
+        for (size_t i = 0; i < n_lead; ++i) {
+            parts = parts || !inputs.messages[i].content_parts.empty();
+        }
+        for (size_t i = 0; i < n_lead; ++i) {
+            const auto & msg = inputs.messages[i];
+            if (!parts) {
+                merged.content += (i > 0 ? "\n\n" : "") + msg.content;
+                continue;
+            }
+            if (i > 0) {
+                merged.content_parts.push_back({ "text", "\n\n" });
+            }
+            if (msg.content_parts.empty()) {
+                merged.content_parts.push_back({ "text", msg.content });
+            } else {
+                merged.content_parts.insert(merged.content_parts.end(), msg.content_parts.begin(), msg.content_parts.end());
+            }
+        }
+        inputs.messages.erase(inputs.messages.begin(), inputs.messages.begin() + n_lead);
+        inputs.messages.insert(inputs.messages.begin(), merged);
+        try {
+            out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+        } catch (const std::exception & e2) {
+            throw std::invalid_argument(std::string("the chat template refused the request: ") + e2.what());
+        }
+    }
 
     llama_params["prompt"] = out_session.prompt().str();
 
@@ -1658,6 +1769,17 @@ json format_response_rerank(
 // other utils
 //
 
+static std::vector<llama_token_data> token_probabilities_sorted(std::vector<llama_token_data> cur, size_t n_top);
+
+// strixllama: the same from a stored row of logits (a checkpoint's)
+std::vector<llama_token_data> get_token_probabilities(const float * logits, int n_logits, size_t n_top) {
+    std::vector<llama_token_data> cur(n_logits);
+    for (llama_token token_id = 0; token_id < n_logits; token_id++) {
+        cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+    }
+    return token_probabilities_sorted(std::move(cur), n_top);
+}
+
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
     std::vector<llama_token_data> cur;
 
@@ -1677,6 +1799,10 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
         }
     }
 
+    return token_probabilities_sorted(std::move(cur), n_top);
+}
+
+static std::vector<llama_token_data> token_probabilities_sorted(std::vector<llama_token_data> cur, size_t n_top) {
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
     if (n_top > cur.size()) {
         n_top = cur.size();
@@ -1947,26 +2073,6 @@ llama_tokens format_prompt_infill(
     return embd_inp;
 }
 
-std::string format_rerank_template(
-        const std::string & tmpl,
-        const std::string & query,
-        const std::string & doc) {
-    std::string prompt;
-    prompt.reserve(tmpl.size());
-    for (size_t pos = 0; pos < tmpl.size();) {
-        if (tmpl.compare(pos, 7, "{query}") == 0) {
-            prompt += query;
-            pos += 7;
-        } else if (tmpl.compare(pos, 10, "{document}") == 0) {
-            prompt += doc;
-            pos += 10;
-        } else {
-            prompt += tmpl[pos++];
-        }
-    }
-    return prompt;
-}
-
 server_tokens format_prompt_rerank(
         const struct llama_model * model,
         const struct llama_vocab * vocab,
@@ -1996,7 +2102,9 @@ server_tokens format_prompt_rerank(
             d += get_media_marker();
         }
 
-        std::string prompt = format_rerank_template(rerank_prompt, q, d);
+        std::string prompt = rerank_prompt;
+        string_replace_all(prompt, "{query}"   , q);
+        string_replace_all(prompt, "{document}", d  );
 
         if (query_files.empty() && doc_files.empty()) {
             server_tokens tokens = tokenize_input_subprompt(vocab, mctx, prompt, false, true, init_opt);
@@ -2211,65 +2319,4 @@ void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, s
         }
     }
 #endif
-}
-
-//
-// server_role
-//
-
-server_role::server_role() {
-    if (is_managed_by_router()) {
-        cmd_out = server_reserve_stdout();
-    }
-}
-
-server_role::~server_role() {
-    if (cmd_out) {
-        fclose(cmd_out);
-    }
-}
-
-bool server_role::is_managed_by_router() {
-    return std::getenv(SERVER_ENV_ROUTER_PORT) != nullptr;
-}
-
-server_role_type server_role::get_role() {
-    const char * role = std::getenv(SERVER_ENV_CHILD_ROLE);
-    return server_role_type_from_str(role ? role : "");
-}
-
-std::thread server_role::setup(const std::function<void(int)> & shutdown_handler) {
-    // setup thread for monitoring stdin
-    return std::thread([shutdown_handler]() {
-        // wait for EOF on stdin
-        SRV_INF("%s", "child server monitoring thread started, waiting for EOF on stdin...\n");
-        bool eof = false;
-        while (true) {
-            std::string line;
-            if (!std::getline(std::cin, line)) {
-                // EOF detected, that means the router server is unexpectedly exit or killed
-                eof = true;
-                break;
-            }
-            if (line.find(CMD_ROUTER_TO_CHILD_EXIT) != std::string::npos) {
-                SRV_INF("%s", "exit command received, exiting...\n");
-                shutdown_handler(0);
-                break;
-            }
-        }
-        if (eof) {
-            SRV_INF("%s", "EOF on stdin detected, forcing shutdown...\n");
-            exit(1);
-        }
-    });
-}
-
-void server_role::notify_to_router(const std::string & state, const json & payload) {
-    json data = {
-        {"state", state},
-        {"payload", payload},
-    };
-    std::lock_guard<std::mutex> lk(mtx_stdout);
-    fprintf(cmd_out, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
-    fflush(cmd_out);
 }

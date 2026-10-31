@@ -94,8 +94,6 @@ struct common_chat_msg {
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
-    // non-OpenAI message keys as a JSON object string, only for templates that read them (DeepSeek V4.1)
-    std::string                               extra_json;
 
     common_json to_json_oaicompat(bool concat_typed_text = false) const;
 
@@ -197,6 +195,26 @@ struct common_chat_msg_spans {
             }
         }
         return -1;
+    }
+
+    // strixllama: the first user message, where a system prompt (and its tool list) ends
+    int32_t first_user_message_pos() const {
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) it->pos;
+            }
+        }
+        return -1;
+    }
+
+    // strixllama: where a user message or a tool result starts - the points a conversation grows from
+    bool is_turn_start(int32_t pos) const {
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if ((it->role == COMMON_CHAT_ROLE_USER || it->role == COMMON_CHAT_ROLE_TOOL) && pos == (int32_t) it->pos) {
+                return true;
+            }
+        }
+        return false;
     }
 };
 

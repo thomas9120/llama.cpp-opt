@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <set>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -272,11 +273,14 @@ static bool is_reserved_name(const std::string & name) {
     return RESERVED_NAMES.find(name) != RESERVED_NAMES.end();
 }
 
+static std::regex INVALID_RULE_CHARS_RE("[^a-zA-Z0-9-]+");
 static std::regex GRAMMAR_LITERAL_ESCAPE_RE("[\r\n\"\\\\]");
 static std::regex GRAMMAR_RANGE_LITERAL_ESCAPE_RE("[\r\n\"\\]\\-\\\\]");
 static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
     {'\r', "\\r"}, {'\n', "\\n"}, {'"', "\\\""}, {'-', "\\-"}, {']', "\\]"}, {'\\', "\\\\"}
 };
+
+static const int MAX_PATTERN_DEPTH = 100;
 
 static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?', '^', '$'};
 static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
@@ -308,22 +312,6 @@ static std::string format_literal(const std::string & literal) {
 }
 
 std::string gbnf_format_literal(const std::string & literal) { return format_literal(literal); }
-
-// same as std::regex_replace with [^a-zA-Z0-9-]+ -> "-", no std::regex: libstdc++ recurses per char
-std::string gbnf_format_rule_name(const std::string & name) {
-    std::string out;
-    bool in_invalid = false;
-    for (char c : name) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
-            out += c;
-            in_invalid = false;
-        } else if (!in_invalid) {
-            out += '-';
-            in_invalid = true;
-        }
-    }
-    return out;
-}
 
 static size_t gbnf_escape_length(const std::string & pattern, size_t pos) {
     if (pos + 1 >= pattern.length() || pattern[pos] != '\\') {
@@ -360,17 +348,6 @@ private:
     std::unordered_set<std::string> _refs_being_resolved;
     std::vector<std::string> _errors;
     std::vector<std::string> _warnings;
-    int _depth = 0;
-
-    struct depth_guard {
-        int & depth;
-        depth_guard(int & depth) : depth(depth) {
-            if (++depth > COMMON_RECURSIVE_LIMIT) {
-                throw std::invalid_argument("JSON schema is nested more than " + std::to_string(COMMON_RECURSIVE_LIMIT) + " levels deep");
-            }
-        }
-        ~depth_guard() { depth--; }
-    };
 
     template <typename T>
     static const T & as(const common_chat_schema & node) {
@@ -378,7 +355,7 @@ private:
     }
 
     std::string _add_rule(const std::string & name, const std::string & rule) {
-        std::string esc_name = gbnf_format_rule_name(name);
+        std::string esc_name = regex_replace(name, INVALID_RULE_CHARS_RE, "-");
         if (_rules.find(esc_name) == _rules.end() || _rules[esc_name] == rule) {
             _rules[esc_name] = rule;
             return esc_name;
@@ -506,7 +483,7 @@ private:
                         }
                     }
                     paren_depth++;
-                    if (paren_depth > COMMON_RECURSIVE_LIMIT) {
+                    if (paren_depth > MAX_PATTERN_DEPTH) {
                         throw unsupported_pattern("pattern nesting too deep");
                     }
                     seq.emplace_back("(" + to_rule(transform()) + ")", false);
@@ -668,11 +645,7 @@ private:
         std::string char_rule = _add_primitive("char", PRIMITIVE_RULES.at("char"));
         std::ostringstream out;
         out << "[\"] ( ";
-        // one level per char of the longest name
-        std::function<void(size_t, int)> visit = [&](size_t idx, int depth) {
-            if (depth >= COMMON_RECURSIVE_LIMIT) {
-                throw std::invalid_argument("JSON schema property name is longer than " + std::to_string(COMMON_RECURSIVE_LIMIT) + " chars");
-            }
+        std::function<void(size_t)> visit = [&](size_t idx) {
             const auto & node = trie.nodes[idx];
             std::string rejects;
             auto first = true;
@@ -687,7 +660,7 @@ private:
                 out << "[" << c << "]";
                 if (!trie.nodes[child].children.empty()) {
                     out << " (";
-                    visit(child, depth + 1);
+                    visit(child);
                     out << ")";
                 } else {
                     out << " " << char_rule << "+";
@@ -697,7 +670,7 @@ private:
                 out << " | [^\"" << rejects << "] " << char_rule << "*";
             }
         };
-        visit(0, 0);
+        visit(0);
 
         out << " )";
         if (trie.nodes[0].pattern < 0) {
@@ -710,7 +683,8 @@ private:
     std::string _resolve_ref(const common_chat_schema_ref & schema) {
         auto it = schema.ref.find('#');
         std::string ref_fragment = it != std::string::npos ? schema.ref.substr(it + 1) : schema.ref;
-        std::string ref_name = "ref" + gbnf_format_rule_name(ref_fragment);
+        static const std::regex nonalphanumeric_regex(R"([^a-zA-Z0-9-]+)");
+        std::string ref_name = "ref" + std::regex_replace(ref_fragment, nonalphanumeric_regex, "-");
         if (_rules.find(ref_name) == _rules.end() && _refs_being_resolved.find(schema.ref) == _refs_being_resolved.end()) {
             if (!schema.target) {
                 _errors.push_back("Unresolved $ref " + schema.ref);
@@ -860,13 +834,10 @@ public:
         std::unordered_set<std::string> required;
         std::vector<std::pair<std::string, const common_chat_schema *>> properties;
         std::map<std::string, size_t> enum_values;
-        std::function<void(const common_chat_schema &, bool, int)> add_component = [&](const common_chat_schema & comp, bool is_required, int depth) {
-            if (depth >= COMMON_RECURSIVE_LIMIT) {
-                throw std::invalid_argument("JSON schema is nested more than " + std::to_string(COMMON_RECURSIVE_LIMIT) + " levels deep");
-            }
+        std::function<void(const common_chat_schema &, bool)> add_component = [&](const common_chat_schema & comp, bool is_required) {
             if (comp.kind() == common_chat_schema::KIND_REF) {
                 if (const auto * target = as<common_chat_schema_ref>(comp).target) {
-                    add_component(*target, is_required, depth + 1);
+                    add_component(*target, is_required);
                 }
             } else if (comp.kind() == common_chat_schema::KIND_OBJECT) {
                 for (const auto & prop : as<common_chat_schema_object>(comp).properties) {
@@ -884,10 +855,10 @@ public:
         for (const auto & child : schema.children) {
             if (child->kind() == common_chat_schema::KIND_ANY_OF) {
                 for (const auto & alt : as<common_chat_schema_any_of>(*child).children) {
-                    add_component(*alt, false, 0);
+                    add_component(*alt, false);
                 }
             } else {
-                add_component(*child, true, 0);
+                add_component(*child, true);
             }
         }
         if (!enum_values.empty()) {
@@ -905,8 +876,6 @@ public:
     }
 
     std::string visit(const common_chat_schema & schema, const std::string & name) {
-        // the $ref targets are visited too, a $ref chain is not bounded by the builder
-        depth_guard guard(_depth);
         std::string rule_name = is_reserved_name(name) ? name + "-" : name.empty() ? "root" : name;
         std::string sub_name  = name + (name.empty() ? "" : "-");
 
@@ -1021,6 +990,149 @@ public:
         return ss.str();
     }
 };
+
+common_json common_tool_parameters_flatten(const common_json & params) {
+    if (!params.is_object()) {
+        return params;
+    }
+    const bool combined = params.contains("$ref") || params.contains("allOf") || params.contains("oneOf") ||
+                          params.contains("anyOf") || params.contains("not");
+    if (!combined) {
+        return params;
+    }
+    // local references only: #/$defs/NAME and #/definitions/NAME of this schema
+    auto resolve = [&](const json & s0) -> json {
+        json s = s0;
+        for (int depth = 0; depth < 16 && s.is_object() && s.contains("$ref") && s.at("$ref").is_string(); ++depth) {
+            const std::string ref = s.at("$ref").get<std::string>();
+            json next;
+            bool found = false;
+            for (const char * key : {"$defs", "definitions"}) {
+                const std::string prefix = std::string("#/") + key + "/";
+                if (ref.rfind(prefix, 0) == 0 && params.contains(key) && params.at(key).is_object()) {
+                    const std::string name = ref.substr(prefix.size());
+                    if (params.at(key).contains(name)) {
+                        next  = params.at(key).at(name);
+                        found = true;
+                    }
+                }
+            }
+            if (!found) {
+                break;
+            }
+            s = next;
+        }
+        return s;
+    };
+    std::vector<std::string>              order;
+    std::map<std::string, json>           props;
+    std::set<std::string>                 required;
+    std::set<std::string>                 forbidden;
+    // strixllama: alternatives that each require a property, but no property in all of them (OpenCase: caseType or
+    // caseId) - the flat list requires none, and the grammar let a call through with no parameter at all, which
+    // every alternative rejects. minProperties: 1 on the flat schema keeps that much (issue: Deep Rulith, 10-09)
+    bool                                  need_one = false;
+    std::function<void(const json &, bool, int)> collect = [&](const json & s0, bool is_required, int depth) {
+        if (depth > 16) {
+            return;
+        }
+        const json s = resolve(s0);
+        if (!s.is_object()) {
+            return;
+        }
+        if (s.contains("properties") && s.at("properties").is_object()) {
+            for (const auto & [k, v] : s.at("properties").items()) {
+                if (props.find(k) == props.end()) {
+                    order.push_back(k);
+                    props[k] = v;
+                }
+            }
+        }
+        if (is_required && s.contains("required") && s.at("required").is_array()) {
+            for (const auto & r : s.at("required")) {
+                if (r.is_string()) {
+                    required.insert(r.get<std::string>());
+                }
+            }
+        }
+        if (s.contains("not") && s.at("not").is_object() && s.at("not").contains("required") &&
+                s.at("not").at("required").is_array()) {
+            for (const auto & r : s.at("not").at("required")) {
+                if (r.is_string()) {
+                    forbidden.insert(r.get<std::string>());
+                }
+            }
+        }
+        if (s.contains("allOf") && s.at("allOf").is_array()) {
+            for (const auto & part : s.at("allOf")) {
+                collect(part, is_required, depth + 1);
+            }
+        }
+        for (const char * key : {"oneOf", "anyOf"}) {
+            if (!s.contains(key) || !s.at(key).is_array()) {
+                continue;
+            }
+            size_t n_alt = 0, n_alt_req = 0;
+            std::map<std::string, size_t> n_req;
+            for (const auto & alt0 : s.at(key)) {
+                const json alt = resolve(alt0);
+                if (!alt.is_object()) {
+                    continue;
+                }
+                ++n_alt;
+                collect(alt, false, depth + 1);
+                bool alt_req = alt.contains("minProperties") && alt.at("minProperties").is_number() &&
+                               alt.at("minProperties").get<double>() >= 1;
+                if (alt.contains("required") && alt.at("required").is_array()) {
+                    for (const auto & r : alt.at("required")) {
+                        if (r.is_string()) {
+                            n_req[r.get<std::string>()]++;
+                            alt_req = true;
+                        }
+                    }
+                }
+                n_alt_req += alt_req ? 1 : 0;
+            }
+            if (is_required) {
+                for (const auto & [k, n] : n_req) {
+                    if (n_alt > 0 && n == n_alt) {
+                        required.insert(k);
+                    }
+                }
+                if (n_alt > 0 && n_alt_req == n_alt) {
+                    need_one = true;
+                }
+            }
+        }
+    };
+    collect(params, true, 0);
+    if (order.empty()) {
+        return params;
+    }
+    json out   = params;
+    json p     = json::object();
+    json r     = json::array();
+    for (const auto & k : order) {
+        if (forbidden.find(k) != forbidden.end()) {
+            continue;
+        }
+        p[k] = props[k];
+        if (required.find(k) != required.end()) {
+            r.push_back(k);
+        }
+    }
+    out["properties"] = p;
+    out["required"]   = r;
+    // the combinators are spelled out now: the schema document takes a top-level $ref or alternatives over properties
+    for (const char * key : {"$ref", "allOf", "oneOf", "anyOf", "not"}) {
+        out.erase(key);
+    }
+    if (need_one && r.empty() && !p.empty() &&
+            !(out.contains("minProperties") && out.at("minProperties").is_number() && out.at("minProperties").get<double>() >= 1)) {
+        out["minProperties"] = 1;
+    }
+    return out;
+}
 
 std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) {
 #ifdef LLAMA_USE_LLGUIDANCE

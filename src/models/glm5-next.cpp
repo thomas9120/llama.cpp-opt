@@ -442,12 +442,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_sinkhorn(
     return comb;
 }
 
-llama_model_glm5_next::graph::hc_pre
-llama_model_glm5_next::graph::build_hc_pre(
+ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
         ggml_tensor * x,
         ggml_tensor * hc_fn,
         ggml_tensor * hc_scale,
         ggml_tensor * hc_base,
+        ggml_tensor ** post,
+        ggml_tensor ** comb,
         int il) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
@@ -474,29 +475,29 @@ llama_model_glm5_next::graph::build_hc_pre(
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_pre", il);
 
-    ggml_tensor * post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
-    post = dsv4_hc_affine(ctx0, post, scale_post, base_post);
-    post = ggml_sigmoid(ctx0, post);
-    post = ggml_scale(ctx0, post, 2.0f);
-    cb(post, "hc_post", il);
+    *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
+    *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
+    *post = ggml_sigmoid(ctx0, *post);
+    *post = ggml_scale(ctx0, *post, 2.0f);
+    cb(*post, "hc_post", il);
 
-    ggml_tensor * comb = nullptr;
     if (cparams.fused_dsv4_hc_comb) {
-        comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
+        *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
                 (int32_t) hparams.dsv4_hc_sinkhorn_iters);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, comb, il});
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, *comb, il});
     } else {
         ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
         ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
 
-        comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
-        comb = dsv4_hc_affine(ctx0, comb, scale_comb, base_comb);
-        comb = ggml_reshape_3d(ctx0, comb, hc, hc, nt);
-        comb = build_hc_sinkhorn(comb, il);
+        *comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
+        *comb = dsv4_hc_affine(ctx0, *comb, scale_comb, base_comb);
+        *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
+        *comb = build_hc_sinkhorn(*comb, il);
     }
-    cb(comb, "hc_comb", il);
+    cb(*comb, "hc_comb", il);
 
-    return { build_hc_pre(x, pre, il), post, comb };
+    ggml_tensor * result = build_hc_pre(x, pre, il);
+    return result;
 }
 
 ggml_tensor * llama_model_glm5_next::graph::build_hc_post(
@@ -608,9 +609,8 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
-    // the NextN block has a full indexer, nothing to carry in
-    dsa_out dsa = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, nullptr, il);
-    cur = dsa.cur;
+    ggml_tensor * prev_sel = nullptr;
+    cur = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, &prev_sel, il);
     cb(cur, "mtp_attn_out", il);
 
     // narrow to the output tokens before the position-wise FFN; unmasked nextn embeddings need all rows
@@ -711,8 +711,10 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;
-        hc_pre attn_hc = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, il);
-        cur = attn_hc.cur;
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+
+        cur = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, il);
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -723,17 +725,14 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_kda_layer(cur, layer, inp_rs, d_conv, head_dim, n_head_kda,
                                   d_inner, n_seq_tokens, n_seqs, il);
         } else {
-            dsa_out dsa = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, prev_sel, il);
-            cur = dsa.cur;
-            prev_sel = dsa.sel;
+            cur = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, &prev_sel, il);
         }
 
-        inpL = build_hc_post(cur, residual, attn_hc.post, attn_hc.comb, il);
+        inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
-        hc_pre ffn_hc = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il);
-        cur = ffn_hc.cur;
+        cur = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, il);
         cb(cur, "hc_ffn_pre", il);
 
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -771,7 +770,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
             cb(cur, "ffn_out", il);
         }
 
-        inpL = build_hc_post(cur, residual, ffn_hc.post, ffn_hc.comb, il);
+        inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
     }
@@ -976,7 +975,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
             ggml_tensor * tail = hparams.indexer_kpool_select_tail ? inp_kpool->tail_idxs : nullptr;
             GGML_ASSERT(kpool*n_top_pool + (tail ? tail->ne[0] : 0) == (int64_t) inp_kpool->n_sel);
 
-            ggml_tensor * sel = build_fused_top_k_mask(kq_mask, top_k, score, inp_kpool->pool_idxs, tail, nullptr, il);
+            ggml_tensor * sel = build_fused_top_k_mask(kq_mask, top_k, score, inp_kpool->pool_idxs, tail, il);
             cb(sel, "indexer_sel", il);
 
             return sel;
@@ -1040,11 +1039,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
 // Nope MLA layer with sparse attention over the indexer selection
 
-llama_model_glm5_next::graph::dsa_out
-llama_model_glm5_next::graph::build_dsa_layer(
+ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
-        llm_graph_input_kpool * inp_kpool, ggml_tensor * prev_sel, int il) {
+        llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il) {
 
     const auto * mctx_mla = mctx_hyb->get_attn();
 
@@ -1075,11 +1073,13 @@ llama_model_glm5_next::graph::build_dsa_layer(
 
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 
-    ggml_tensor * sel = prev_sel;
+    ggml_tensor * sel = nullptr;
     if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer
         sel = build_kpool_select(cur, qr, kq_mask, layer, mctx_hyb, inp_kpool, il);
+        *prev_sel = sel;
     } else {
-        GGML_ASSERT(sel != nullptr && "shared indexer layer must follow a full indexer layer");
+        GGML_ASSERT(*prev_sel != nullptr && "shared indexer layer must follow a full indexer layer");
+        sel = *prev_sel;
     }
 
     ggml_build_forward_expand(gf, q_absorbed);
@@ -1099,5 +1099,5 @@ llama_model_glm5_next::graph::build_dsa_layer(
     out = ggml_mul_mat(ctx0, layer.wo, out);
     cb(out, "attn_out", il);
 
-    return { out, sel };
+    return out;
 }

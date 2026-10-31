@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama-weight-aux.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"
@@ -292,13 +293,30 @@ public:
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
-    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_extra; // I32 [n_rs - n_seqs]
 
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // strixllama: every sequence of the batch reads its state from a row of the cell it is written back to (its newest
+    // state or a rollback snapshot), the usual case; build_rs then marks its gather so a backend may read the rows
+    // s_copy names directly instead. Part of the graph, so it must match for reuse
+    bool gather_in_place = false;
+    static bool in_place(const llama_memory_recurrent_context * mctx, int64_t n_seqs);
+
+    // strixllama: deferred rollback for the gated delta net (llama_memory_recurrent::rec_l). 0 = off, 1 = the batch
+    // runs the deferred-rollback net (a short batch: each sequence no longer than a verify, in its own cell), 2 = the
+    // plain net, after a replay that brings the states with records up to date. Part of the graph, so it must match
+    // for reuse; lazy_info is its per-sequence input
+    int lazy_mode = 0;
+    ggml_tensor * lazy_info = nullptr;  // I32 [5, n_seqs]
+    static int lazy_mode_for(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch);
+    // fills lazy_info (before s_copy consumes the rollback index). The context is passed in: a hybrid input's can_reuse
+    // updates its own context, not this one's
+    void set_lazy_input(const llama_ubatch * ubatch, const llama_memory_recurrent_context * mctx_cur) const;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -367,6 +385,10 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+
+    // strixllama: the first cell of the cache view the graph was built with (llama_kv_cache::get_kv_window);
+    // the views carry it as an offset, so a graph is reusable only for the same one
+    uint32_t kv_off = 0;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -834,11 +856,17 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // strixllama: the rot_in / rot_out of the model's EXL3 weights (llama-weight-aux.h)
+    const llama_weight_aux_map * waux = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
+        // strixllama: a ragged ubatch builds its per-sequence parts per group of token counts; it carries a prompt, so
+        // a graph built for it is not worth keeping
         bool can_reuse_ubatch =
+            !ubatch.ragged() && !other.ubatch.ragged() &&
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
@@ -894,6 +922,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // strixllama: a draft step that reuses the captured selection builds a different graph (IndexShare)
+        if (cparams.mtp_share_reuse != other.cparams.mtp_share_reuse) {
             return false;
         }
 
@@ -1075,8 +1108,14 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    const llama_weight_aux_map * waux;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // strixllama: run once by the next build_moe_ffn between the experts' down projection and their weighting (graph
+    // order only: what a model puts into the graph there comes before the weighted sum)
+    mutable std::function<void()> moe_before_weighting;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1113,6 +1152,9 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // strixllama: the aux map that holds w's rotations: the model's, or for a weight a draft borrows the target's
+    const llama_weight_aux_map * waux_for(const ggml_tensor * w) const;
+
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
@@ -1337,14 +1379,12 @@ struct llm_graph_context {
                     int   il) const;
 
     // ggml_top_k_mask with top_k, score and extra viewed in the row layout of kq_mask, see ggml.h
-    // mask replaces kq_mask as the source of the kept values, it broadcasts to the rows
     ggml_tensor * build_fused_top_k_mask(
             ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
             ggml_tensor * top_k,   // [n_top, n_tokens]
             ggml_tensor * score,   // [n_pick, n_tokens], can be null
             ggml_tensor * blocks,  // [n_blk, n_pick], can be null
             ggml_tensor * extra,   // [n_extra, n_tokens], can be null
-            ggml_tensor * mask,    // [n_kv], kq_mask if null
                     int   il) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
@@ -1411,8 +1451,8 @@ struct llm_graph_context {
     //         `llama_memory_recurrent`
     ggml_tensor * build_rs(
             ggml_tensor * s,
-            ggml_tensor * state_copy,
             ggml_tensor * state_copy_main,
+            ggml_tensor * state_copy_extra,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,

@@ -677,6 +677,41 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void test_pinned_no_inplace() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input  = make_input_1d(ctx, 4);
+    ggml_tensor * parent = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * child  = ggml_scale(ctx, parent, 3.0f);
+
+    ggml_set_output(child);
+    ggml_build_forward_expand(graph, child);
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_pin_tensor(galloc.get(), parent);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    GGML_ASSERT(!memory_overlap(parent, child));
+}
+
+static void test_pinned_view_root_no_inplace() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input  = make_input_1d(ctx, 4);
+    ggml_tensor * root   = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * view   = ggml_view_1d(ctx, root, 4, 0);
+    ggml_tensor * child  = ggml_scale(ctx, view, 3.0f);
+
+    ggml_set_output(child);
+    ggml_build_forward_expand(graph, child);
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_pin_tensor(galloc.get(), root);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    GGML_ASSERT(!memory_overlap(root, child));
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1121,6 +1156,8 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_pinned_no_inplace", test_pinned_no_inplace);
+    run("test_pinned_view_root_no_inplace", test_pinned_view_root_no_inplace);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);

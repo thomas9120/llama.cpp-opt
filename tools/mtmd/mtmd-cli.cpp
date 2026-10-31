@@ -75,7 +75,6 @@ static void inject_test_response_marker() {
 
 struct mtmd_cli_context {
     mtmd::context_ptr ctx_vision;
-    mtmd_helper_cap   mtmd_cap = {};
     common_init_result_ptr llama_init;
 
     llama_model       * model;
@@ -121,8 +120,7 @@ struct mtmd_cli_context {
 
         init_vision_context(params);
 
-        mtmd_cap = mtmd_helper_get_capabilities(model, ctx_vision.get());
-        if (!mtmd_cap.chat) {
+        if (!mtmd_helper_model_can_chat(lctx, ctx_vision.get())) {
             LOG_ERR("Model does not support chat mode\n");
             LOG_ERR("Hint: for TTS models, please use llama-tts\n");
             exit(1);
@@ -567,7 +565,7 @@ int main(int argc, char ** argv) {
 
     if (g_is_interrupted) return 130;
 
-    if (ctx.mtmd_cap.audio_stream) {
+    if (mtmd_support_audio_stream(ctx.ctx_vision.get())) {
         if (params.image.size() != 1) {
             LOG_ERR("This model transcribes audio in realtime, pass exactly one --audio file\n");
             return 1;
@@ -626,7 +624,7 @@ int main(int argc, char ** argv) {
         if (mtmd_support_audio(ctx.ctx_vision.get())) {
             LOG("\n   /audio <path>    load an audio");
         }
-        if (ctx.mtmd_cap.video) {
+        if (mtmd_helper_support_video(ctx.ctx_vision.get())) {
             LOG("\n   /video <path>    load a video");
         }
         LOG("\n   /clear           clear the chat history");

@@ -26,7 +26,6 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -742,56 +741,50 @@ static inline bool glob_class_match(const char c, const char * pattern, const ch
 }
 
 // simple glob: * matches non-/ chars, ** matches anything including /, [] matches character class
-// only wildcards recurse, too many wildcards: no match
-static bool glob_match(const char * pattern, const char * str, int depth = 0) {
-    if (depth >= COMMON_RECURSIVE_LIMIT) {
+static inline bool glob_match(const char * pattern, const char * str) {
+    if (*pattern == '\0') {
+        return *str == '\0';
+    }
+    if (pattern[0] == '*' && pattern[1] == '*') {
+        const char * p = pattern + 2;
+        if (glob_match(p, str)) return true;
+        if (*str != '\0') return glob_match(pattern, str + 1);
         return false;
     }
-    while (*pattern != '\0') {
-        if (pattern[0] == '*' && pattern[1] == '*') {
-            const char * p = pattern + 2;
-            for (;; str++) {
-                if (glob_match(p, str, depth + 1)) return true;
-                if (*str == '\0') return false;
-            }
+    if (*pattern == '*') {
+        const char * p = pattern + 1;
+        for (; *str != '\0' && *str != '/'; str++) {
+            if (glob_match(p, str)) return true;
         }
-        if (*pattern == '*') {
-            const char * p = pattern + 1;
-            for (; *str != '\0' && *str != '/'; str++) {
-                if (glob_match(p, str, depth + 1)) return true;
-            }
-            return glob_match(p, str, depth + 1);
-        }
-        if (*pattern == '?' && *str != '\0' && *str != '/') {
-            pattern++;
-            str++;
-            continue;
-        }
-        if (*pattern == '[') {
-            const char * class_end = pattern + 1;
-            // If first character after '[' is ']' or '-', treat it as literal
-            if (*class_end == ']' || *class_end == '-') {
-                class_end++;
-            }
-            while (*class_end != '\0' && *class_end != ']') {
-                class_end++;
-            }
-            if (*class_end == ']') {
-                if (*str == '\0' || !glob_class_match(*str, pattern + 1, class_end)) return false;
-                pattern = class_end + 1;
-                str++;
-                continue;
-            }
-            if (*str != '[') return false;
-            pattern++;
-            str++;
-            continue;
-        }
-        if (*pattern != *str) return false;
-        pattern++;
-        str++;
+        return glob_match(p, str);
     }
-    return *str == '\0';
+    if (*pattern == '?' && *str != '\0' && *str != '/') {
+        return glob_match(pattern + 1, str + 1);
+    }
+    if (*pattern == '[') {
+        const char * class_end = pattern + 1;
+        // If first character after '[' is ']' or '-', treat it as literal
+        if (*class_end == ']' || *class_end == '-') {
+            class_end++;
+        }
+        while (*class_end != '\0' && *class_end != ']') {
+            class_end++;
+        }
+        if (*class_end == ']') {
+            if (*str == '\0') return false;
+            bool matched = glob_class_match(*str, pattern + 1, class_end);
+            return matched && glob_match(class_end + 1, str + 1);
+        } else {
+            if (*str == '[') {
+                return glob_match(pattern + 1, str + 1);
+            }
+            return false;
+        }
+    }
+    if (*pattern == *str) {
+        return glob_match(pattern + 1, str + 1);
+    }
+    return false;
 }
 
 bool glob_match(const std::string & pattern, const std::string & str) {
@@ -924,13 +917,9 @@ std::string fs_path_to_utf8(const std::filesystem::path & path) {
 }
 
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data) {
-    // a random suffix gives every writer its own temporary file, across processes and containers
-    std::random_device rd;
-    const uint64_t id = ((uint64_t) rd() << 32) | rd();
-
     std::error_code ec;
     std::filesystem::path path_tmp = path;
-    path_tmp += "." + std::to_string(id) + ".tmp";
+    path_tmp += ".tmp";
 
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), ec);
@@ -2254,6 +2243,15 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
 
+    // strixllama: state rows that are one block, in entry order, go in as it (llama_batch_ext_set_state_rows), read in
+    // place - an MTP catch-up's rows for a prompt chunk are the target's own rows (see the draft-mtp process())
+    bool state_block = n > 0 && tokens[off].state.data != nullptr && tokens[off].state.n_rows == 1;
+    for (int32_t i = off + 1; state_block && i < off + n; ++i) {
+        const llama_embd & s = tokens[i].state;
+        state_block = s.n_rows == 1 && s.n_embd == tokens[off].state.n_embd &&
+            s.data == tokens[off].state.data + (size_t) (i - off)*tokens[off].state.n_embd;
+    }
+
     for (int32_t i = off; i < off + n; ++i) {
         const token & t = tokens[i];
 
@@ -2284,12 +2282,15 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         if (t.output) {
             llama_batch_ext_set_output_logits(res, idx, true);
         }
-        if (t.state.data) {
+        if (t.state.data && !state_block) {
             llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
         }
+    }
+    if (state_block) {
+        llama_batch_ext_set_state_rows(res, tokens[off].state.data); // contexts without a state input ignore it
     }
 
     return res;
@@ -2370,7 +2371,7 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    return data_tgt.size() + data_dft.size() + data_spec.size() + logits.size()*sizeof(float);
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2386,6 +2387,7 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+    logits.clear();
 }
 
 void common_prompt_checkpoint::update_pos(

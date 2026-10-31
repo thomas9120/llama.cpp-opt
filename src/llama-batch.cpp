@@ -134,7 +134,14 @@ bool llama_batch_allocr::init(
     }
 
     if (has_state) {
-        state_vec = batch_inp.state;
+        // strixllama: rows given in place (llama_batch_ext_set_state_rows) are read where they are: an MTP catch-up
+        // of 8192 tokens carries 335 MB of them, which the copies here and in the ubatch cost ~3% of prefill
+        if (batch_inp.state_rows) {
+            state_ptr = batch_inp.state_rows;
+        } else {
+            state_vec = batch_inp.state;
+            state_ptr = state_vec.data();
+        }
     }
 
     //
@@ -305,7 +312,7 @@ bool llama_batch_allocr::init(
             /*.n_pos        =*/ n_pos_per_embd,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
-            /*.embd_state   =*/ state_vec.empty() ? nullptr : state_vec.data(),
+            /*.embd_state   =*/ const_cast<float *>(state_ptr),
             /*.pos          =*/ batch.pos,
             /*.n_seq_id     =*/ batch.n_seq_id,
             /*.seq_id       =*/ batch.seq_id,
@@ -342,7 +349,7 @@ bool llama_batch_allocr::init(
     // consistency checks
     //
 
-    if (n_pos_per_embd > 1) {
+    if (n_pos_per_embd > 1 || allow_pos_jumps) {
         // in a mixed batch, the first entry of each seq picks the rule
         std::vector<int8_t> seq_first_embd(n_seq_max, batch.token ? 0 : 1);
         if (mixed) {
@@ -829,6 +836,190 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     return ubatch_add(idxs, 1, true);
 }
 
+// strixllama: the hybrid memory ran a batch of sequences with different token counts - conversations decoding next to
+// a prompt, several prompts at once - as several equal-length ubatches, each a pass over all the weights: five prompt
+// tails of 292-556 tokens took six passes. Here they are one ubatch, and the model runs its per-sequence parts (the
+// recurrent layers) once per group of equal counts (llama_ubatch::ragged).
+llama_ubatch llama_batch_allocr::split_ragged(uint32_t n_ubatch, uint32_t n_keep_tail) {
+    GGML_ASSERT(!has_cpl && "split_ragged needs a batch without coupled sequences");
+
+    // the sequence sets with tokens left, and where each stands
+    std::vector<seq_set_t> sets;
+    std::vector<int32_t>   cur;   // index into seq_set_map[set] of the first unused token
+    std::vector<uint32_t>  rem;   // unused tokens left
+    for (int32_t i = 0; i < batch.n_tokens && sets.size() < n_ubatch; ++i) {
+        if (used[i]) {
+            continue;
+        }
+        bool seen = false;
+        for (const auto & s : sets) {
+            if (s == seq_set[i]) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        const auto & idxs = seq_set_map[seq_set[i]];
+        int32_t c = 0;
+        while (c < (int32_t) idxs.size() && used[idxs[c]]) {
+            ++c;
+        }
+        sets.push_back(seq_set[i]);
+        cur.push_back(c);
+        rem.push_back((uint32_t) (idxs.size() - c));
+    }
+
+    if (sets.empty()) {
+        return {};
+    }
+
+    // strixllama: which sequences share this ubatch. The short ones - decode tokens, MTP verify drafts, a prompt of a
+    // few tokens - do, up to STRIX_MIX_TOTAL tokens in all (32: what the sparse attention's decode gather takes). A
+    // longer one, a prompt chunk, joins only while sharing costs less than a pass of its own: next to other sequences
+    // its queries score the sparse-attention index over their blocks too, and theirs over its own (~3 ns a query and
+    // cell), and a ubatch of several sequences loses the causal score bounds (about half of a query's own context).
+    // STRIX_MIX_CELLS: the query-cells a chunk may add (6e7, ~0.2 s: about a pass). 0.2.7 let every chunk share, and a
+    // 49K-token prompt next to one 88K-token answer ran at 793 t/s against 1012 alone, 74K next to two at 695 against
+    // 988; letting none share cost six agents' tails of a few hundred tokens a fifth more prompt time. The first long
+    // one that stays out goes next. STRIX_MIX_MAX: the most tokens a short one has left (0: 0.2.7's ragged ubatches)
+    {
+        static const uint32_t mix_max = [] {
+            const char * e = getenv("STRIX_MIX_MAX");
+            return e ? (uint32_t) atoi(e) : 32u;
+        }();
+        static const uint32_t mix_total = [] {
+            const char * e = getenv("STRIX_MIX_TOTAL");
+            return e ? (uint32_t) atoi(e) : 32u;
+        }();
+        static const double mix_cells = [] {
+            const char * e = getenv("STRIX_MIX_CELLS");
+            return e ? atof(e) : 6e7;
+        }();
+        if (mix_max > 0 && sets.size() > 1) {
+            // a sequence's context once this ubatch is in: its last position here
+            std::vector<double> ctx(sets.size());
+            for (uint32_t s = 0; s < sets.size(); ++s) {
+                ctx[s] = (double) batch.pos[seq_set_map[sets[s]].back()] + 1.0;
+            }
+            std::vector<uint32_t> by_len(sets.size());
+            for (uint32_t s = 0; s < by_len.size(); ++s) {
+                by_len[s] = s;
+            }
+            std::stable_sort(by_len.begin(), by_len.end(), [&](uint32_t x, uint32_t y) { return rem[x] < rem[y]; });
+            std::vector<uint32_t> keep;
+            uint32_t total = 0;
+            for (const uint32_t s : by_len) {
+                if (rem[s] > mix_max || (!keep.empty() && total + rem[s] > mix_total)) {
+                    break;
+                }
+                keep.push_back(s);
+                total += rem[s];
+            }
+            double sum_ctx = 0.0, sum_rem = 0.0;
+            for (const uint32_t s : keep) {
+                sum_ctx += ctx[s];
+                sum_rem += rem[s];
+            }
+            for (uint32_t s = 0; s < sets.size(); ++s) {
+                if (rem[s] <= mix_max) {
+                    continue;   // short: kept above, or next
+                }
+                double add = 0.0;
+                if (!keep.empty()) {
+                    add = rem[s]*sum_ctx + ctx[s]*sum_rem + 0.5*rem[s]*ctx[s];
+                    if (keep.size() == 1) {
+                        add += 0.5*rem[keep[0]]*ctx[keep[0]];   // the first one's bounds go too
+                    }
+                }
+                if (keep.empty() || add <= mix_cells) {
+                    keep.push_back(s);
+                    sum_ctx += ctx[s];
+                    sum_rem += rem[s];
+                }
+            }
+            if (keep.size() < sets.size()) {
+                std::sort(keep.begin(), keep.end());   // batch order
+                std::vector<seq_set_t> k_sets;
+                std::vector<int32_t>   k_cur;
+                std::vector<uint32_t>  k_rem;
+                for (const uint32_t s : keep) {
+                    k_sets.push_back(sets[s]);
+                    k_cur.push_back(cur[s]);
+                    k_rem.push_back(rem[s]);
+                }
+                sets.swap(k_sets);
+                cur.swap(k_cur);
+                rem.swap(k_rem);
+            }
+        }
+    }
+
+    // the shortest first, whole; what n_ubatch has left goes to the longer ones in turn
+    std::vector<uint32_t> order(sets.size());
+    for (uint32_t s = 0; s < order.size(); ++s) {
+        order[s] = s;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return rem[x] < rem[y]; });
+
+    std::vector<uint32_t> take(sets.size(), 0);
+    uint32_t budget = n_ubatch;
+    for (const uint32_t s : order) {
+        uint32_t t = std::min(rem[s], budget);
+        // [TAG_RECURRENT_ROLLBACK_SPLITS] the trailing n_keep_tail tokens of a set stay in one ubatch
+        if (t < rem[s] && rem[s] - t < n_keep_tail) {
+            t = rem[s] > n_keep_tail ? std::min(t, rem[s] - n_keep_tail) : 0;
+        }
+        take[s] = t;
+        budget -= t;
+    }
+
+    uint32_t n_total = 0;
+    for (const uint32_t t : take) {
+        n_total += t;
+    }
+    if (n_total == 0) {
+        // nothing fit under the tail rule: the first set alone, as split_equal would take it
+        const uint32_t s = order[0];
+        uint32_t t = std::min(rem[s], n_ubatch);
+        if (t < rem[s] && rem[s] - t < n_keep_tail && rem[s] > n_keep_tail) {
+            t = std::min(t, rem[s] - n_keep_tail);
+        }
+        take[s] = std::max<uint32_t>(t, 1);
+    }
+
+    // sets of one count next to each other, the longest first
+    std::vector<uint32_t> chosen;
+    for (const uint32_t s : order) {
+        if (take[s] > 0) {
+            chosen.push_back(s);
+        }
+    }
+    std::stable_sort(chosen.begin(), chosen.end(), [&](uint32_t x, uint32_t y) { return take[x] > take[y]; });
+
+    std::vector<int32_t>  idxs;
+    std::vector<uint32_t> seq_ntok;
+    for (const uint32_t s : chosen) {
+        const auto & all = seq_set_map[sets[s]];
+        for (uint32_t k = 0; k < take[s]; ++k) {
+            const int32_t idx = all[cur[s] + k];
+            idxs.push_back(idx);
+            used[idx] = true;
+            ++n_used;
+        }
+        seq_ntok.push_back(take[s]);
+    }
+
+    // one count for all: an ordinary equal-length ubatch
+    bool uniform = true;
+    for (const uint32_t t : seq_ntok) {
+        uniform = uniform && t == seq_ntok[0];
+    }
+
+    return ubatch_add(idxs, (uint32_t) seq_ntok.size(), true, uniform ? nullptr : &seq_ntok);
+}
+
 void llama_batch_allocr::clear() {
     n_outputs = 0;
 
@@ -838,6 +1029,7 @@ void llama_batch_allocr::clear() {
     embd_vec    .clear();
     is_embd_vec .clear();
     state_vec   .clear();
+    state_ptr = nullptr;
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -861,12 +1053,25 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
-llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs,
+                                            const std::vector<uint32_t> * seq_ntok) {
     const uint32_t n_tokens = idxs.size();
 
-    assert(n_tokens%n_seqs == 0);
+    assert(seq_ntok || n_tokens%n_seqs == 0);
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
+
+    if (seq_ntok) {
+        GGML_ASSERT(seq_ntok->size() == n_seqs);
+        udata->seq_ntok = *seq_ntok;
+        udata->seq_tok0.resize(n_seqs);
+        uint32_t t0 = 0;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            udata->seq_tok0[s] = t0;
+            t0 += (*seq_ntok)[s];
+        }
+        GGML_ASSERT(t0 == n_tokens);
+    }
 
     const bool mixed_batch = !is_embd_vec.empty();
 
@@ -880,10 +1085,23 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool mixed     = mixed_batch && n_embd_rows > 0 && n_embd_rows < n_tokens;
     const bool use_token = batch.token && !(mixed_batch && n_embd_rows == n_tokens);
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
-    const bool has_state = !state_vec.empty();
+    const bool has_state = state_ptr != nullptr;
 
-    const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
-    const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
+    // strixllama: a ubatch of consecutive tokens of the batch reads their embedding rows where they are, as the
+    // whole-batch ubatch does. Copied - after zero-filling the copy - the rows of an 8192-token MTP catch-up (40 KB a
+    // token, 335 MB) took ~70 ms of one thread before its first pass. The batch outlives its ubatches
+    bool embd_in_place = use_embd && !idxs.empty();
+    for (size_t i = 1; embd_in_place && i < idxs.size(); ++i) {
+        embd_in_place = idxs[i] == idxs[0] + (int32_t) i;
+    }
+
+    const int64_t n_embd_all  = use_embd && !embd_in_place ? (int64_t) n_tokens*n_embd : 0;
+    // strixllama: consecutive entries read their state rows where they are, as their embedding rows (embd_in_place)
+    bool state_in_place = has_state && !idxs.empty();
+    for (size_t i = 1; state_in_place && i < idxs.size(); ++i) {
+        state_in_place = idxs[i] == idxs[0] + (int32_t) i;
+    }
+    const int64_t n_state_all = has_state && !state_in_place ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -908,7 +1126,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (use_embd) {
+        if (use_embd && !embd_in_place) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -916,8 +1134,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->type[i] = is_embd_vec[idxs[i]];
         }
 
-        if (has_state) {
-            memcpy(udata->embd_state.data() + i*n_embd_state, state_vec.data() + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
+        if (has_state && !state_in_place) {
+            memcpy(udata->embd_state.data() + i*n_embd_state, state_ptr + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -956,17 +1174,20 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
     }
 
+    const uint32_t * p_ntok = seq_ntok ? udata->seq_ntok.data() : nullptr;
+    const uint32_t * p_tok0 = seq_ntok ? udata->seq_tok0.data() : nullptr;
+
     llama_ubatch res {
         /*.b_equal_seqs =*/ equal_seqs,
         /*.n_tokens     =*/ n_tokens,
-        /*.n_seq_tokens =*/ n_tokens/n_seqs,
+        /*.n_seq_tokens =*/ seq_ntok ? 0 : n_tokens/n_seqs,
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
-        /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
-        /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
+        /*.embd         =*/ use_embd  ? (embd_in_place ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data()) : nullptr,
+        /*.embd_state   =*/ has_state ? (state_in_place ? const_cast<float *>(state_ptr) + (int64_t) idxs[0]*n_embd_state : udata->embd_state.data()) : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
@@ -976,6 +1197,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
+        /*.seq_ntok     =*/ p_ntok,
+        /*.seq_tok0     =*/ p_tok0,
     };
 
     if (debug > 0) {
@@ -992,6 +1215,13 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
         LLAMA_LOG_DEBUG("%s:   equal_seqs   = %d\n", __func__, ubatch.equal_seqs());
         LLAMA_LOG_DEBUG("%s:   n_tokens     = %d\n", __func__, ubatch.n_tokens);
         LLAMA_LOG_DEBUG("%s:   n_seq_tokens = %d\n", __func__, ubatch.n_seq_tokens);
+        if (ubatch.ragged()) {
+            std::stringstream ss;
+            for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                ss << ubatch.ntok(s) << " ";
+            }
+            LLAMA_LOG_DEBUG("%s:   ragged       = [ %s]\n", __func__, ss.str().c_str());
+        }
         LLAMA_LOG_DEBUG("%s:   n_seqs       = %d\n", __func__, ubatch.n_seqs);
         LLAMA_LOG_DEBUG("%s:   n_seqs_unq   = %d\n", __func__, ubatch.n_seqs_unq);
 
@@ -1189,6 +1419,7 @@ void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
     state .clear();
+    state_rows = nullptr;
     n_embd = 0;
 }
 
@@ -1391,6 +1622,23 @@ bool llama_batch_ext_set_embd_token(llama_batch_ext * batch, int32_t idx, llama_
 
 bool llama_batch_ext_set_embd_state(llama_batch_ext * batch, int32_t idx, llama_embd embd) {
     return batch->set_token_state(idx, embd);
+}
+
+bool llama_batch_ext_set_state_rows(llama_batch_ext * batch, const float * rows) {
+    if (!rows || batch->n_embd_state == 0 || batch->tokens.empty()) {
+        return false;
+    }
+    for (const auto & t : batch->tokens) {
+        if (t.has_state) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < batch->tokens.size(); ++i) {
+        batch->tokens[i].has_state = true;
+        batch->tokens[i].state_off = i*batch->n_embd_state;
+    }
+    batch->state_rows = rows;
+    return true;
 }
 
 bool llama_batch_ext_set_output_embd(llama_batch_ext * batch, int32_t idx, bool value) {

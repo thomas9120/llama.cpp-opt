@@ -1,3 +1,4 @@
+#include "json-schema-to-grammar.h"
 #include "parsers.h"
 
 // Kimi K3 - XTML tagged format, built by open_tag/close_tag macros:
@@ -98,7 +99,7 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
         foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
-            const json   schema   = common_chat_tool_parameters(function);
+            const json   schema   = common_tool_parameters_flatten(common_chat_tool_parameters(function));
 
             // arguments come one tag per key, with the JSON type in a type="..."
             // attribute. the type is taken from the tool schema instead, as it tells

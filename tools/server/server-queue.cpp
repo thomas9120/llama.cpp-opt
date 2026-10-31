@@ -4,6 +4,11 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <functional>
 #include <chrono>
 #include <thread>
 
@@ -101,8 +106,20 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
-        if (!found) {
+        // strixllama: then the first that waits for a slot rather than for another slot's prefix (wait_slot) or for
+        // room in the pool (wait_pool, handed back by the server once it fits): those would only be deferred again, and
+        // the free slot would stay free under the tasks behind them
+        for (auto it = queue_tasks_deferred.begin(); !found && it != queue_tasks_deferred.end(); ++it) {
+            if (it->wait_slot < 0 && !it->wait_pool) {
+                QUE_DBG("pop deferred task, id_task = %d\n", it->id);
+                queue_tasks.emplace_front(std::move(*it));
+                queue_tasks_deferred.erase(it);
+                found = true;
+                break;
+            }
+        }
+        // if not tasks found using the slot, just pop the first deferred task (default behavior) - not one waiting for room
+        if (!found && !queue_tasks_deferred.front().wait_pool) {
             QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
             queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
             queue_tasks_deferred.pop_front();
@@ -110,6 +127,30 @@ void server_queue::pop_deferred_task(int id_slot) {
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
+}
+
+void server_queue::pop_deferred_if(const std::function<bool(const server_task &)> & ready) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    bool moved = false;
+    // strixllama: the ready ones go to the front of the queue in the order they were deferred
+    std::vector<server_task> ready_tasks;
+    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ) {
+        if (ready(*it)) {
+            QUE_DBG("pop deferred task (ready), id_task = %d\n", it->id);
+            ready_tasks.push_back(std::move(*it));
+            it = queue_tasks_deferred.erase(it);
+            moved = true;
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = ready_tasks.rbegin(); it != ready_tasks.rend(); ++it) {
+        queue_tasks.emplace_front(std::move(*it));
+    }
+    if (moved) {
+        time_last_task = ggml_time_ms();
+        condition_tasks.notify_one();
+    }
 }
 
 void server_queue::wait_until_no_sleep() {
@@ -518,7 +559,7 @@ void server_response_reader::post_task(server_task && task, bool front) {
     GGML_ASSERT(!task.is_parent() && "not supported, use post_tasks() instead");
     task.index = 0;
     id_tasks.insert(task.id);
-    states.push_back(task_result_state());
+    states.push_back(task.create_state());   // strixllama: with the task's resp_tools
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
 }
@@ -530,11 +571,11 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, const
     size_t index = 0;
     for (auto & task : tasks) {
         task.index = index++;
-        states.push_back(task_result_state(session));
+        states.push_back(task.create_state(session));
         // for child tasks
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;
-            states.push_back(task_result_state(session));
+            states.push_back(child_task.create_state(session));
         }
     }
     GGML_ASSERT(states.size() == id_tasks.size());
@@ -558,6 +599,7 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             }
         } else {
             if (result->is_error()) {
+                log_task(result->index, result.get(), "error");
                 stop(); // cancel remaining tasks
                 SRV_DBG("%s", "received error result, stopping further processing\n");
                 return result;
@@ -570,6 +612,7 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             }
             if (result->is_stop()) {
                 received_count++;
+                log_task(result->index, result.get(), "done");
             }
             return result;
         }
@@ -618,5 +661,193 @@ void server_response_reader::stop() {
         queue_tasks.post(std::move(cancel_tasks), true);
     } else {
         SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
+    }
+}
+
+//
+// strixllama: the request log (STRIX_REQUEST_LOG)
+//
+// One JSON object per line. Long values that repeat from request to request - each message of a conversation, the
+// tools, the grammar - are written in full once per file as {"hash": h, "value": v} and afterwards as {"same_as": h},
+// so a long agent session costs its new content, not its whole history on every call, and every line can still be
+// rebuilt from its file. A file over STRIX_REQUEST_LOG_MAX_MB (default 1024) is closed and the next one is <file>.2,
+// <file>.3, ...; with STRIX_REQUEST_LOG_KEEP=n only the newest n of them are kept (default: all).
+
+namespace {
+struct strix_request_log {
+    std::mutex  mtx;
+    std::string base;
+    std::string path;
+    FILE *      f         = nullptr;
+    size_t      bytes     = 0;
+    size_t      max_bytes = (size_t) 1024 << 20;
+    int         part      = 1;
+    int         keep      = 0;                      // files kept, 0 = all
+    std::unordered_set<std::string> seen;   // hashes written in full in the current file
+
+    strix_request_log() {
+        const char * p = getenv("STRIX_REQUEST_LOG");
+        if (p && *p && strcmp(p, "0") != 0) {
+            base = path = p;
+        }
+        const char * m = getenv("STRIX_REQUEST_LOG_MAX_MB");
+        if (m && atoi(m) > 0) {
+            max_bytes = (size_t) atoi(m) << 20;
+        }
+        const char * k = getenv("STRIX_REQUEST_LOG_KEEP");
+        if (k && atoi(k) > 0) {
+            keep = atoi(k);
+        }
+    }
+
+    bool open_file() {
+        if (f) {
+            return true;
+        }
+        f = fopen(path.c_str(), "ab");
+        if (!f) {
+            return false;
+        }
+        fseek(f, 0, SEEK_END);
+        bytes = (size_t) ftell(f);
+        return true;
+    }
+
+    json dedupe(const json & v) {
+        const std::string s = v.dump_safe();
+        if (s.size() < 256) {
+            return v;
+        }
+        char h[24];
+        snprintf(h, sizeof(h), "%016llx", (unsigned long long) std::hash<std::string>{}(s));
+        if (seen.count(h)) {
+            return json{{"same_as", h}};
+        }
+        seen.insert(h);
+        return json{{"hash", h}, {"value", v}};
+    }
+
+    void write(json body, json server, json rec) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!open_file()) {
+            return;
+        }
+        if (body.is_object()) {
+            for (auto it = body.begin(); it != body.end(); ++it) {
+                if (it.key() == "messages" && it.value().is_array()) {
+                    json ms = json::array();
+                    for (const auto & m : it.value()) {
+                        ms.push_back(dedupe(m));
+                    }
+                    it.value() = std::move(ms);
+                } else {
+                    it.value() = dedupe(it.value());
+                }
+            }
+        } else {
+            body = dedupe(body);
+        }
+        if (server.is_object()) {
+            for (auto it = server.begin(); it != server.end(); ++it) {
+                it.value() = dedupe(it.value());
+            }
+        }
+        rec["request"] = std::move(body);
+        rec["server"]  = std::move(server);
+        const std::string line = rec.dump_safe() + "\n";
+        fwrite(line.data(), 1, line.size(), f);
+        fflush(f);
+        bytes += line.size();
+        if (bytes > max_bytes) {
+            fclose(f);
+            f = nullptr;
+            seen.clear();
+            path = base + "." + std::to_string(++part);
+            if (keep > 0 && part - keep >= 1) {
+                const int old = part - keep;
+                std::remove((old == 1 ? base : base + "." + std::to_string(old)).c_str());
+            }
+        }
+    }
+};
+
+strix_request_log & request_log() {
+    static strix_request_log l;
+    return l;
+}
+
+std::string request_log_time() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+    std::tm tm {};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    char out[80];
+    snprintf(out, sizeof(out), "%s.%03lld", buf, ms);
+    return out;
+}
+} // namespace
+
+bool server_request_log_on() {
+    return !request_log().base.empty();
+}
+
+void server_response_reader::log_task(size_t idx, server_task_result * res, const char * outcome) {
+    if (log_body.empty()) {
+        return;
+    }
+    if (log_done.size() < std::max(states.size(), idx + 1)) {
+        log_done.resize(std::max(states.size(), idx + 1), false);
+    }
+    if (log_done[idx]) {
+        return;
+    }
+    log_done[idx] = true;
+    json rec = {
+        {"time",    request_log_time()},
+        {"outcome", outcome},
+        {"index",   idx},
+    };
+    auto * fin = dynamic_cast<server_task_result_cmpl_final *>(res);
+    if (res) {
+        rec["task"] = res->id;
+    }
+    if (idx < states.size()) {
+        rec["raw_output"] = states[idx].generated_text;
+        if (!fin) {
+            rec["parsed_so_far"] = states[idx].chat_msg.to_json_oaicompat();
+        }
+    }
+    if (fin) {
+        static const char * stops[] = {"none", "eos", "word", "limit"};
+        rec["slot"]   = fin->id_slot;
+        rec["parsed"] = fin->oaicompat_msg.to_json_oaicompat();
+        rec["stop"]   = {{"type", stops[(int) fin->stop & 3]}, {"word", fin->stopping_word}, {"truncated", fin->truncated}};
+        rec["usage"]  = {{"prompt_tokens", fin->n_prompt_tokens}, {"cached_tokens", fin->n_prompt_tokens_cache},
+                         {"generated_tokens", fin->n_decoded}};
+    } else if (res && res->is_error()) {
+        rec["error"] = res->to_json();
+    }
+    json body = json::parse_no_throw(log_body);
+    if (body.is_discarded()) {
+        body = log_body;
+    }
+    request_log().write(std::move(body), log_server, std::move(rec));
+}
+
+void server_response_reader::log_unfinished() {
+    if (log_body.empty()) {
+        return;
+    }
+    for (size_t i = 0; i < states.size(); ++i) {
+        if (i >= log_done.size() || !log_done[i]) {
+            log_task(i, nullptr, cancelled ? "cancelled" : "unfinished");
+        }
     }
 }

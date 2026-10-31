@@ -414,7 +414,6 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
-    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
@@ -442,7 +441,6 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
-    template bool llama_model_loader::get_key<int32_t>    (enum llm_kv kid, int32_t & result,     bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
 
     template<>
@@ -962,6 +960,10 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             } break;
         case GGML_OP_MUL_MAT:
             {
+                if (ggml_is_exl3(w->type)) {   // strixllama: EXL3 weights are used with ggml_mul_mat_had
+                    op_tensor = llama_weight_aux_test_op(ctx, w, 0);
+                    break;
+                }
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
                 op_tensor = ggml_mul_mat(ctx, w, b);
             } break;
@@ -970,6 +972,10 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 // Used for either MoE expert routing or embedded adapter routing
                 const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used_max();
                 GGML_ASSERT(n_ids_used > 0);
+                if (ggml_is_exl3(w->type)) {
+                    op_tensor = llama_weight_aux_test_op(ctx, w, n_ids_used);
+                    break;
+                }
                 ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
                 op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
@@ -1102,7 +1108,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (mode == LLAMA_LAZY_MODE_AUTO && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1191,6 +1197,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
             size_data -= nbytes;
             n_created++;
+            skip_weight_aux(t_meta, tn.str());
 
             return nullptr;
         }
@@ -1318,11 +1325,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // strixllama: per-expert widths: the class-0 tensor holds its own experts (<base>.cmap counts them all)
+        std::vector<int64_t> ne_v(ne);
+        if (tid != -1 && ggml_is_exl3(type) && ne_v.size() == 3 &&
+                gguf_find_tensor(metadata, (llama_weight_aux_base(tn.str()) + ".cmap").c_str()) >= 0) {
+            ne_v[2] = (int64_t) (gguf_get_tensor_size(metadata, tid) / (ggml_row_size(type, ne_v[0])*ne_v[1]));
+        }
+
         ggml_tensor t_meta;
         memset(&t_meta, 0, sizeof(ggml_tensor));
         t_meta.type = type;
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            t_meta.ne[dim] = dim < ne_v.size() ? ne_v[dim] : 1;
             GGML_ASSERT(t_meta.ne[dim] >= 1);
             if (dim == 0) {
                 t_meta.nb[dim] = ggml_type_size(type);
@@ -1340,11 +1354,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (ggml_is_exl3(type)) {
+            create_weight_aux(ctx, ret, tn.str(), false);
+        }
         return ret;
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
-    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
+    // strixllama: per-expert widths: an EXL3 class-0 tensor has fewer experts than the model, <base>.cmap all of them
+    std::vector<int64_t> ne_v(ne);
+    if (ne_v.size() == 3) {
+        const ggml_tensor * m = get_tensor_meta(tn.str().c_str());
+        if (m && ggml_is_exl3(m->type) && m->ne[2] < ne_v[2]) {
+            const ggml_tensor * cm = get_tensor_meta((llama_weight_aux_base(tn.str()) + ".cmap").c_str());
+            if (cm && cm->ne[0] == ne_v[2]) {
+                ne_v[2] = m->ne[2];
+            }
+        }
+    }
+    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne_v, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
     }
@@ -1396,7 +1424,142 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         n_created++;
     }
 
+    if (ggml_is_exl3(tensor->type)) {
+        create_weight_aux(ctx, tensor, tn.str(), duplicated);
+    }
+
     return tensor;
+}
+
+// strixllama: <base>.rot_in [ne0(, ne2)] and <base>.rot_out [ne1(, ne2)] (F16 or F32) of the EXL3 weight w, created in
+// the context (and so the buffer) of the weight (ranma.cpp, MIT)
+void llama_model_loader::create_weight_aux(ggml_context * ctx, ggml_tensor * w, const std::string & name, bool duplicated) {
+    const std::string base = llama_weight_aux_base(name);
+    if (w->ne[0] % 128 != 0 || w->ne[1] % 128 != 0 || w->ne[3] != 1) {
+        throw std::runtime_error(format("EXL3 tensor '%s' has shape %s, the first two dims must be multiples of 128",
+                name.c_str(), llama_format_tensor_shape(w).c_str()));
+    }
+
+    llama_weight_aux aux;
+
+    // strixllama: per-expert widths: <base>.cmap I32 [E] and the classes <base>.c1.weight, <base>.c2.weight
+    int64_t n_exp_all = w->ne[2];
+    auto aux_tensor = [&](const std::string & tname, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2) -> ggml_tensor * {
+        ggml_tensor * t = nullptr;
+        if (files.empty()) {
+            t = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+        } else {
+            const ggml_tensor * meta = get_tensor_meta(tname.c_str());
+            if (duplicated) {
+                t = ggml_get_tensor(ctx, tname.c_str());
+            }
+            if (t == nullptr) {
+                t = ggml_dup_tensor(ctx, meta);
+                if (duplicated) {
+                    size_data += ggml_nbytes(meta);
+                } else {
+                    n_created++;
+                }
+            }
+        }
+        ggml_set_name(t, tname.c_str());
+        return t;
+    };
+    const std::string cname = base + ".cmap";
+    const int64_t cmap_tid = files.empty() ? gguf_find_tensor(metadata, cname.c_str()) : -1;
+    const ggml_tensor * cmeta = files.empty() ? nullptr : get_tensor_meta(cname.c_str());
+    if (cmeta || cmap_tid >= 0) {
+        const int64_t E = cmeta ? cmeta->ne[0] : (int64_t) (gguf_get_tensor_size(metadata, cmap_tid) / sizeof(int32_t));
+        if (cmeta && (cmeta->type != GGML_TYPE_I32 || ggml_nelements(cmeta) != E)) {
+            throw std::runtime_error(format("EXL3 class map '%s' must be I32 [experts]", cname.c_str()));
+        }
+        aux.cmap = aux_tensor(cname, GGML_TYPE_I32, E, 1, 1);
+        int64_t total = w->ne[2];
+        for (int c = 1; c <= 2; ++c) {
+            const std::string wname = base + ".c" + std::to_string(c) + ".weight";
+            if (files.empty()) {
+                const int64_t tid = gguf_find_tensor(metadata, wname.c_str());
+                if (tid < 0) {
+                    continue;
+                }
+                const ggml_type type = gguf_get_tensor_type(metadata, tid);
+                const int64_t ne2 = (int64_t) (gguf_get_tensor_size(metadata, tid) / (ggml_row_size(type, w->ne[0])*w->ne[1]));
+                aux.wc[c - 1] = aux_tensor(wname, type, w->ne[0], w->ne[1], ne2);
+            } else {
+                const ggml_tensor * meta = get_tensor_meta(wname.c_str());
+                if (meta == nullptr) {
+                    continue;
+                }
+                if (!ggml_is_exl3(meta->type) || meta->ne[0] != w->ne[0] || meta->ne[1] != w->ne[1] || meta->ne[3] != 1) {
+                    throw std::runtime_error(format("EXL3 class '%s' is %s %s, expected an EXL3 [%" PRId64 ", %" PRId64 ", n]",
+                            wname.c_str(), ggml_type_name(meta->type), llama_format_tensor_shape(meta).c_str(), w->ne[0], w->ne[1]));
+                }
+                aux.wc[c - 1] = aux_tensor(wname, meta->type, 0, 0, 0);
+            }
+            total += aux.wc[c - 1]->ne[2];
+        }
+        if (aux.wc[0] == nullptr || total != E) {
+            throw std::runtime_error(format("EXL3 weight '%s': its classes hold %" PRId64 " experts, the map %" PRId64,
+                    name.c_str(), total, E));
+        }
+        n_exp_all = E;
+    }
+
+    const struct {
+        const char  *  suffix;
+        int64_t        len;
+        ggml_tensor ** dst;
+    } rots[2] = {
+        { "rot_in",  w->ne[0], &aux.rot_in  },
+        { "rot_out", w->ne[1], &aux.rot_out },
+    };
+    for (const auto & r : rots) {
+        const std::string rname = base + "." + r.suffix;
+        ggml_tensor * t = nullptr;
+        if (files.empty()) {
+            const int64_t tid = gguf_find_tensor(metadata, rname.c_str());
+            t = ggml_new_tensor_2d(ctx, tid >= 0 ? gguf_get_tensor_type(metadata, tid) : GGML_TYPE_F16, r.len, n_exp_all);
+        } else {
+            const ggml_tensor * rmeta = get_tensor_meta(rname.c_str());
+            if (rmeta == nullptr) {
+                throw std::runtime_error(format("EXL3 weight '%s' needs tensor '%s', which is not in the model", name.c_str(), rname.c_str()));
+            }
+            // [len, experts], or [len] / [len, 1]: one rotation for all experts
+            if ((rmeta->type != GGML_TYPE_F16 && rmeta->type != GGML_TYPE_F32) ||
+                    rmeta->ne[0] != r.len || (rmeta->ne[1] != n_exp_all && rmeta->ne[1] != 1) || rmeta->ne[2] != 1 || rmeta->ne[3] != 1) {
+                throw std::runtime_error(format("EXL3 tensor '%s' is %s %s, expected f16 or f32 [%" PRId64 ", %" PRId64 "]",
+                        rname.c_str(), ggml_type_name(rmeta->type), llama_format_tensor_shape(rmeta).c_str(), r.len, n_exp_all));
+            }
+            if (duplicated) {
+                t = ggml_get_tensor(ctx, rname.c_str());
+            }
+            if (t == nullptr) {
+                t = ggml_dup_tensor(ctx, rmeta);
+                if (duplicated) {
+                    size_data += ggml_nbytes(rmeta);
+                } else {
+                    n_created++;
+                }
+            }
+        }
+        ggml_set_name(t, rname.c_str());
+        *r.dst = t;
+    }
+    waux[w] = aux;
+}
+
+void llama_model_loader::skip_weight_aux(const ggml_tensor * w, const std::string & name) {
+    if (!ggml_is_exl3(w->type)) {
+        return;
+    }
+    const std::string base = llama_weight_aux_base(name);
+    for (const char * suffix : { "rot_in", "rot_out", "cmap", "c1.weight", "c2.weight" }) {   // strixllama: + classes
+        const ggml_tensor * rmeta = get_tensor_meta((base + "." + suffix).c_str());
+        if (rmeta) {
+            size_data -= ggml_nbytes(rmeta);
+            n_created++;
+        }
+    }
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

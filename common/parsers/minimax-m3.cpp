@@ -1,3 +1,4 @@
+#include "json-schema-to-grammar.h"
 #include "parsers.h"
 
 common_chat_params common_chat_params_init_minimax_m3(const common_chat_template &          tmpl,
@@ -88,7 +89,7 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
         foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
-            auto         params   = common_chat_tool_parameters(function);
+            auto         params   = common_tool_parameters_flatten(common_chat_tool_parameters(function));
             auto         doc      = std::make_shared<const common_chat_schema_document>(common_chat_schema_from_json(params));
 
             // The template expands argument values recursively in XML (see the to_xml() macro)

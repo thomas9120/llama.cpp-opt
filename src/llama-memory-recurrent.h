@@ -18,7 +18,6 @@ class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
             const llama_model & model,
-                         bool   no_alloc,
                     ggml_type   type_r,
                     ggml_type   type_s,
                          bool   offload,
@@ -74,10 +73,54 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // strixllama: layers this memory actually keeps state for; the layer filter can leave none (the MTP
+    // draft's hybrid-idx memory), and then the cell position bookkeeping has nothing to protect
+    uint32_t n_layer_recr = 0;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // strixllama: deferred rollback for the gated delta net (ggml_gated_delta_net_lazy; STRIX_GDN_LAZY=0: off). A verify batch
+    // leaves the state row of its cell as it found it and records per token what a replay needs; the next batch replays
+    // the records its rollback kept. Per recurrent layer a record buffer [rec_floats, rec_cap, 2 * size] (two sets per
+    // cell), and per cell how many records are pending - 0 means its rows hold the state as the plain net leaves them
+    // (slot rs_idx of the cell) - which set holds them, and how many of them its last batch wrote (what a rollback may
+    // take back). While its set has room a short batch appends its records after the pending ones and leaves the row
+    // as it is (rec_append, STRIX_GDN_ACC=W: W records a set, default 8; also without MTP, where decode batches then
+    // record); else it writes the replayed state back and starts the other set. The row is written once per ~W tokens.
+    uint32_t rec_floats = 0;
+    uint32_t rec_cap    = 0;  // records a set holds
+    bool     rec_append = false;
+    int32_t  gdn_s  = 0;      // S_v = S_k
+    int32_t  gdn_hv = 0;      // value heads
+    int32_t  gdn_hk = 0;      // key heads
+    std::vector<ggml_tensor *> rec_l;
+    std::vector<uint32_t>      rec_n;
+    std::vector<uint8_t>       rec_set;
+    std::vector<uint32_t>      rec_last;
+
+    bool lazy_on() const { return rec_floats > 0; }
+
+    // the records a cell's sequence would replay: its last batch's, less the rollback
+    uint32_t rec_pending(uint32_t cell) const;
+
+    // the state of `cell` for layer il as the plain net would hold it, computed from its row and records on the host
+    // (the same fmaf as the kernels): what state_write saves, and what seq_cp copies
+    void rec_materialize(uint32_t cell, int32_t il, std::vector<float> & out) const;
+
+    // the cell's state moved to its slot-0 rows (all recurrent tensors), its records and its sequences' rollback
+    // dropped: the plain net's view of it is right from then on. For cells two sequences share (seq_cp), and for
+    // the cells a checkpoint writes
+    void rec_flatten(uint32_t cell);
+
+    // the replay of a cell's n_rep pending records on the device, by the kernel the next batch would run (bitwise
+    // the host replay): its rows then hold the plain net's state. Needs the context's backends (init_update) and
+    // a backend with the entry; false otherwise, and the host replays. STRIX_GDN_DEV_REPLAY=0: off
+    bool rec_replay_device(uint32_t cell, uint32_t n_rep) const;
+    bool rec_replay_device_ok() const;
+    llama_context * lctx_sync = nullptr;
 
     // computed before each graph build
     uint32_t n = 0;
@@ -121,8 +164,8 @@ private:
 
     const uint32_t n_seq_max = 1;
 
-    // ggml contexts for the RS cache along with the allocated backend buffers:
-    llama_memory_bufs ctxs_bufs;
+    // ggml contexts for the KV cache along with the allocated backend buffers:
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
@@ -182,6 +225,24 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    ggml_tensor * get_rec_l(int32_t il) const;
+    bool lazy_on() const;
+    uint32_t get_n_rs_seq() const;
+    int32_t gdn_s() const;
+    int32_t gdn_hv() const;
+    int32_t gdn_hk() const;
+
+    // strixllama: the per-cell input of the deferred-rollback net (lazy = true, n = n_seqs) or of the replay that brings
+    // the states up to date before the plain net (lazy = false, n = n_rs: the extras build_rs copies along too): row
+    // read, row written, records replayed, set read, set written - see llama_memory_recurrent::rec_l. Reads the rollback
+    // index without consuming it (s_copy does that), and moves the cells on: for the lazy net they hold n_seq_tokens
+    // records in the other set afterwards, else none.
+    void lazy_info(int32_t * info, int n, bool lazy, uint32_t n_seq_tokens) const;
+
+    // strixllama: whether every i < n reads its state from a row of its own cell (head + i: the newest state, or a
+    // rollback snapshot of it), the cell its new state is written to. Unlike s_copy it consumes no rollback index
+    bool s_copy_own_cell(int n) const;
 
 private:
     const llama_memory_status status;

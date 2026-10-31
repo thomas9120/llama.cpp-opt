@@ -220,6 +220,7 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_DIRECT = 3,
     };
 
     enum llama_context_type {
@@ -1105,6 +1106,36 @@ extern "C" {
     // Get the number of threads used for prompt and batch processing (multiple token).
     LLAMA_API int32_t llama_n_threads_batch(struct llama_context * ctx);
 
+    // strixllama: start reading, in the background, whatever the batch tokens[n_context..n_tokens) will read from
+    // disk (the per-layer-embedding rows of models that stream them); the first n_context tokens are the ones that
+    // precede it, which n-gram lookups reach back into. A caller that knows the next batch - a server walking a
+    // long prompt - calls this before decoding the current one, so the reads overlap its compute and that batch's
+    // gather becomes a copy; from then on llama_decode stops prefetching the batch it is handed. No-op for other
+    // models.
+    LLAMA_API void llama_strix_prefetch(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context);
+    // strixllama: the same rows for the batch about to run, read now on a thread of their own (a prompt's first batch)
+    LLAMA_API void llama_strix_pregather_now(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context);
+
+    // strixllama: a sequence's attention rows by position, so a server can move a conversation to disk and back a
+    // stretch of positions at a time instead of as one state. A position's row is every attention-type cache's
+    // (the KV cache, the sparse-attention indexer) every layer's K and V for that position; a range of n positions
+    // is laid out per cache, and within it per layer, as a state's data is. The recurrent state is not in the rows:
+    // it is one per sequence, and goes through llama_state_seq_*_ext with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY.
+    // llama_strix_kv_row_size is 0 for a context that cannot serve rows (another memory, V transposed, several
+    // streams).
+    LLAMA_API size_t llama_strix_kv_row_size(const struct llama_context * ctx);
+    // the rows of positions [p0, p0 + n) of seq_id into dst (n * row size bytes). False when a position has no cell
+    // or more than one, or its cell is not a plain text token's
+    LLAMA_API bool llama_strix_kv_get_rows(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, void * dst, size_t size);
+    // seq_id loses whatever it held and gets cells for positions [0, n) of tokens, with no data yet
+    LLAMA_API bool llama_strix_kv_alloc(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n);
+    // rows into positions [p0, p0 + n) of cells llama_strix_kv_alloc made; src is laid out for src_rows positions,
+    // of which the first n are used
+    LLAMA_API bool llama_strix_kv_set_rows(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, const void * src, int32_t src_rows);
+    // strixllama: the attention rows of seq_src at positions [p0, p0 + n) copied into the cells seq_dst holds for them
+    // (llama_strix_kv_alloc), device to device and queued behind the graphs: nothing is waited for
+    LLAMA_API bool llama_strix_kv_copy_rows(struct llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, int32_t n);
+
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
@@ -1542,7 +1573,6 @@ extern "C" {
                                 size_t num_trigger_tokens),
         "use llama_sampler_init_grammar_lazy_patterns instead");
 
-
     /// @details Lazy grammar sampler, introduced in https://github.com/ggml-org/llama.cpp/pull/9639
     /// @param trigger_patterns A list of patterns that will trigger the grammar sampler. Pattern will be matched from the start of the generation output, and grammar sampler will be fed content starting from its first match group.
     /// @param trigger_tokens A list of tokens that will trigger the grammar sampler. Grammar sampler will be fed content starting from the trigger token included.
@@ -1555,7 +1585,6 @@ extern "C" {
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
 
-
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
                              int32_t   n_vocab,
@@ -1563,10 +1592,6 @@ extern "C" {
                                float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
                                float   penalty_freq,     // must be finite, 0.0 = disabled
                                float   penalty_present); // must be finite, 0.0 = disabled
-
-    /// maximum number of distinct DRY sequence breakers, duplicates not counted
-    /// processing each breaker scans the entire vocabulary, so the init cost is O(num_breakers x n_vocab)
-    #define LLAMA_DRY_MAX_SEQ_BREAKERS 64
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(

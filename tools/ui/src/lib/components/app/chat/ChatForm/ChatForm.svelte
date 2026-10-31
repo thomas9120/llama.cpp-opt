@@ -477,9 +477,12 @@
 		queueMicrotask(() => inputRef?.focus());
 	}
 
-	// A flow outside the chat, e.g. the models page returning to it, asks for the
-	// composer back. Focus on a frame of its own, once the route has settled.
+	// A flow outside the chat, e.g. the models manager closing onto it, asks for the
+	// composer back. The dialog's focus scope is still tearing down, so focus on a
+	// frame of its own.
 	$effect(() => {
+		if (uiStore.manageModelsOpen) return;
+
 		if (!uiStore.composerFocusRequested) return;
 
 		uiStore.composerFocusRequested = false;

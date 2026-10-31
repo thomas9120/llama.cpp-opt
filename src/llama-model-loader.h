@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-weight-aux.h"
 
 #include "ggml-cpp.h"
 
@@ -114,6 +115,7 @@ struct llama_model_loader {
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
 
     llama_files files;
     llama_ftype ftype;
@@ -237,6 +239,11 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // strixllama: the rot_in / rot_out of the EXL3 weights created so far (moved into the model when it is loaded)
+    llama_weight_aux_map waux;
+    void create_weight_aux(ggml_context * ctx, ggml_tensor * w, const std::string & name, bool duplicated);
+    void skip_weight_aux(const ggml_tensor * w, const std::string & name);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

@@ -1652,12 +1652,7 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
-
-                if (i02 == -1) {
-                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
-                    continue;
-                }
+                assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
@@ -1874,6 +1869,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_HAD:
+            {
+                ggml_compute_forward_mul_mat_had(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2114,6 +2113,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_QSA_PACK:
+            {
+                ggml_compute_forward_qsa_pack(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2298,6 +2301,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_QSA_PACK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2369,6 +2373,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_HAD:
         case GGML_OP_OUT_PROD:
         case GGML_OP_SET_ROWS:
             {
@@ -2900,6 +2905,10 @@ struct ggml_cplan ggml_graph_plan(
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
+                case GGML_OP_MUL_MAT_HAD:
+                    {
+                        cur = ggml_cpu_mul_mat_had_wsize(node, n_tasks);
+                    } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
                         cur = 0;
@@ -3034,10 +3043,18 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
-                        const int64_t S_v = node->src[2]->ne[0];
-                        const int64_t K   = ggml_get_op_params_i32(node, 0);
-                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
-                        cur = per_thread * sizeof(float) * n_tasks;
+                        // strixllama: op_params[1] 1 = deferred rollback (a state and a delta per thread), 2 = the
+                        // replay alone (in place, no q)
+                        const int mode = ggml_get_op_params_i32(node, 1);
+                        if (mode == 2) {
+                            cur = 0;
+                        } else {
+                            const int64_t S_v = node->src[2]->ne[0];
+                            const int64_t K   = ggml_get_op_params_i32(node, 0);
+                            const int64_t per_thread = mode == 1 ? S_v + S_v * S_v + CACHE_LINE_SIZE_F32
+                                                                 : S_v + (K > 1 ? S_v * S_v : 0);
+                            cur = per_thread * sizeof(float) * n_tasks;
+                        }
                     } break;
                 case GGML_OP_COUNT:
                     {

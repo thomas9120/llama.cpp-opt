@@ -119,7 +119,7 @@ struct value_t {
         // ops can be builtin calls or operators: "array_access", "object_access"
         std::set<std::string> ops;
         // utility to recursively mark value and its children as used
-        static void mark_used(value & val, bool deep = false, int depth = 0);
+        static void mark_used(value & val, bool deep = false);
     } stats;
 
     value_t() = default;

@@ -6,6 +6,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <vector>
@@ -51,7 +52,44 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_cells[s].clear();
+            run_dirty[s] = 0;
+            run_ok[s]    = 1;
         }
+    }
+
+    // strixllama: whether the cells of seq_id are one run - consecutive cells holding consecutive positions, one cell a
+    // position - and if so its first and last cell and its first position. A conversation in a unified cache is one while
+    // it holds text only; an image repeats a position and breaks it. Checked in full the first time it is asked after a
+    // change other than an append at the next cell with the next position or the removal of the last cell
+    bool seq_run(llama_seq_id seq_id, uint32_t & c0, uint32_t & c1, llama_pos & p0) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        const auto & sc = seq_cells[seq_id];
+        if (sc.empty()) {
+            return false;
+        }
+        if (run_dirty[seq_id]) {
+            bool ok = true;
+            bool first = true;
+            uint32_t prev = 0;
+            for (const uint32_t c : sc) {
+                if (!first && (c != prev + 1 || pos[c] != pos[prev] + 1)) {
+                    ok = false;
+                    break;
+                }
+                prev  = c;
+                first = false;
+            }
+            run_ok[seq_id]    = ok;
+            run_dirty[seq_id] = 0;
+        }
+        if (!run_ok[seq_id]) {
+            return false;
+        }
+        c0 = *sc.begin();
+        c1 = *sc.rbegin();
+        p0 = pos[c0];
+        return true;
     }
 
     void reset_shift() {
@@ -96,6 +134,11 @@ public:
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
         return used.empty() ? 0 : *used.rbegin() + 1;
+    }
+
+    // strixllama: the used cells in index order, for walking the runs of free cells between them
+    const std::set<uint32_t> & used_set() const {
+        return used;
     }
 
     bool get_has_shift() const {
@@ -394,6 +437,108 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // strixllama: the span of the cell array that holds sequence seq_id, [seq_cell_min, seq_cell_max]
+    // return -1 if the sequence is not present
+    int64_t seq_cell_min(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_cells[seq_id].empty() ? -1 : (int64_t) *seq_cells[seq_id].begin();
+    }
+
+    int64_t seq_cell_max(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_cells[seq_id].empty() ? -1 : (int64_t) *seq_cells[seq_id].rbegin();
+    }
+
+    // the number of cells that carry sequence seq_id
+    uint32_t seq_cell_count(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return (uint32_t) seq_cells[seq_id].size();
+    }
+
+    // the (pos, cell) pairs of sequence seq_id, ordered by position
+    const std::set<std::pair<llama_pos, uint32_t>> & seq_pos_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id];
+    }
+
+    // strixllama: move the state of cell isrc to the empty cell idst (the KV data is moved by the caller)
+    void mv(uint32_t isrc, uint32_t idst) {
+        assert(isrc < pos.size());
+        assert(idst < pos.size());
+        assert(isrc != idst);
+        assert(pos[idst] == -1 && seq[idst].none());
+        assert(pos[isrc] != -1);
+        assert(shift[isrc] == 0);
+
+        seq_pos_rm(isrc);
+
+        pos[idst] = pos[isrc];
+        ext[idst] = ext[isrc];
+        seq[idst] = seq[isrc];
+
+        pos[isrc] = -1;
+        ext[isrc].reset();
+        seq[isrc].reset();
+
+        used.erase(isrc);
+        used.insert(idst);
+
+        seq_pos_add(idst);
+    }
+
+    // strixllama: mv() for the n cells [isrc, isrc + n), all of sequence seq_id alone, to the empty cells
+    // [idst, idst + n); the two ranges must not overlap. The index sets' nodes are moved rather than freed and
+    // allocated again, and mv()'s scans over every sequence id are skipped: a rebalance moves tens of thousands
+    // of cells, which took ~100 ms through mv().
+    void mv_range(uint32_t isrc, uint32_t idst, uint32_t n, llama_seq_id seq_id) {
+        assert(isrc + n <= idst || idst + n <= isrc);
+        assert(isrc + n <= pos.size() && idst + n <= pos.size());
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        for (uint32_t j = 0; j < n; ++j) {
+            if (pos[isrc + j] == -1 || seq[isrc + j].count() != 1 || !seq[isrc + j].test(seq_id) || shift[isrc + j] != 0) {
+                for (uint32_t k = 0; k < n; ++k) {
+                    mv(isrc + k, idst + k);
+                }
+                return;
+            }
+        }
+
+        move_index(used,              isrc, idst, n);
+        move_index(seq_cells[seq_id], isrc, idst, n);
+        run_dirty[seq_id] = 1;
+
+        auto & sp = seq_pos[seq_id];
+        for (uint32_t j = 0; j < n; ++j) {
+            auto it = sp.find({ pos[isrc + j], isrc + j });
+            assert(it != sp.end());
+            auto next = std::next(it);
+            auto nh = sp.extract(it);
+            nh.value().second = idst + j;
+            sp.insert(next, std::move(nh));
+        }
+
+        for (uint32_t j = 0; j < n; ++j) {
+            assert(pos[idst + j] == -1 && seq[idst + j].none());
+
+            pos[idst + j] = pos[isrc + j];
+            ext[idst + j] = ext[isrc + j];
+            seq[idst + j] = seq[isrc + j];
+
+            pos[isrc + j] = -1;
+            ext[isrc + j].reset();
+            seq[isrc + j].reset();
+        }
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
@@ -531,16 +676,66 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
+    // strixllama: the cells of each sequence in index order, kept in step with seq_pos. A unified cache
+    // keeps a conversation in one run of cells, and the graph of a batch views only the run of its own
+    // conversations (llama_kv_cache::get_kv_window), which needs a sequence's first and last cell.
+    std::set<uint32_t> seq_cells[LLAMA_MAX_SEQ];
+
+    // strixllama: seq_run's knowledge per sequence - whether it has to look again, and what it found
+    mutable std::vector<uint8_t> run_dirty = std::vector<uint8_t>(LLAMA_MAX_SEQ, 0);
+    mutable std::vector<uint8_t> run_ok    = std::vector<uint8_t>(LLAMA_MAX_SEQ, 1);
+
+    // strixllama: the entries [isrc, isrc + n) of an index of cells, renumbered to [idst, idst + n) in place
+    static void move_index(std::set<uint32_t> & index, uint32_t isrc, uint32_t idst, uint32_t n) {
+        std::vector<std::set<uint32_t>::node_type> nodes;
+        nodes.reserve(n);
+        for (auto it = index.lower_bound(isrc); it != index.end() && *it < isrc + n; ) {
+            auto next = std::next(it);
+            nodes.push_back(index.extract(it));
+            it = next;
+        }
+        auto hint = index.lower_bound(idst);
+        for (auto & nh : nodes) {
+            nh.value() = nh.value() - isrc + idst;
+            hint = std::next(index.insert(hint, std::move(nh)));
+        }
+    }
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
+        // strixllama: the removal of the last cell keeps a run one (and a sequence that is none, none)
+        if (!run_dirty[s] && i != *seq_cells[s].rbegin()) {
+            run_dirty[s] = 1;
+        }
+
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
+
+        seq_cells[s].erase(i);
+
+        if (seq_cells[s].empty()) {
+            run_dirty[s] = 0;
+            run_ok[s]    = 1;
+        }
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
+        // strixllama: an append at the next cell with the next position keeps a run one (and a sequence that is none, none)
+        if (seq_cells[s].empty()) {
+            run_dirty[s] = 0;
+            run_ok[s]    = 1;
+        } else if (!run_dirty[s]) {
+            const uint32_t last = *seq_cells[s].rbegin();
+            if (i != last + 1 || pos[i] != pos[last] + 1) {
+                run_dirty[s] = 1;
+            }
+        }
+
         seq_pos[s].insert({ pos[i], i });
+
+        seq_cells[s].insert(i);
     }
 
     // remove cell i

@@ -1,4 +1,5 @@
 #include "parsers.h"
+#include "json-schema-to-grammar.h"
 
 #include "log.h"
 
@@ -14,7 +15,9 @@ void foreach_function(const json & tools, const std::function<void(size_t, const
 }
 
 void foreach_parameter(const json & function, const std::function<void(size_t, const common_chat_schema_property &, const common_chat_schema_document_ptr &)> & fn) {
-    auto         params = common_chat_tool_parameters(function);
+    // strixllama: the parameters as one flat list whatever form the schema takes (common_tool_parameters_flatten): a
+    // top-level oneOf, allOf or $ref had no parameter here, so the grammar allowed an empty call and nothing else
+    auto         params = common_tool_parameters_flatten(common_chat_tool_parameters(function));
     auto         doc    = std::make_shared<const common_chat_schema_document>(common_chat_schema_from_json(params));
     const auto * object = dynamic_cast<const common_chat_schema_object *>(doc->root.get());
     if (!object) {

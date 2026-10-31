@@ -45,6 +45,7 @@ add_library(mtmd
             models/internvl.cpp
             models/kimivl.cpp
             models/kimik25.cpp
+            models/nemotron-omni.cpp
             models/nemotron-v2-vl.cpp
             models/nemotron-omni.cpp
             models/muse-glimmer.cpp
@@ -67,7 +68,6 @@ add_library(mtmd
             models/pockettts-seanet.cpp
             models/pockettts-spkenc.cpp
             models/pockettts-gen.cpp
-            models/soprano.cpp
             models/step3vl.cpp
             models/siglip.cpp
             models/whisper-enc.cpp

@@ -5,7 +5,6 @@
 	import {
 		CAPABILITY_ICONS,
 		CAPABILITY_LABELS,
-		FILTER_TOGGLE_GROUP_CLASS,
 		FILTER_TOGGLE_ITEM_CLASS,
 		FILTER_TRIGGER_CLASS,
 		MODALITY_FLAG_KEYS,
@@ -90,12 +89,10 @@
 </script>
 
 <!-- below md the carousel keeps a row of its own: a toolbar that also holds a call to
-     action would otherwise squeeze the filters out of sight. The scroll box clips on
-     both axes, so it gets room for the controls' shadows and gives it back outside -->
+     action would otherwise squeeze the filters out of sight -->
 <ScrollCarousel
 	alwaysShowArrows
 	class="min-w-0 flex-1 max-md:w-full max-md:flex-none"
-	containerClass="-m-1 p-1"
 	gapSize="2"
 	innerClass="items-center"
 >
@@ -118,10 +115,11 @@
 	</Select.Root>
 
 	<ToggleGroup.Root
-		class={FILTER_TOGGLE_GROUP_CLASS}
+		class="border border-border/30 bg-muted/60 shadow-sm dark:border-border/20 dark:bg-muted/75"
 		onValueChange={setToggles}
 		type="multiple"
 		value={[...capabilities, ...modalities]}
+		variant="outline"
 	>
 		{#each toggles as toggle (toggle.value)}
 			<ToggleGroup.Item

@@ -10,6 +10,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-exl3.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -546,6 +547,9 @@ static BOOL CALLBACK ggml_time_init_once(PINIT_ONCE once, PVOID param, PVOID *ct
     QueryPerformanceFrequency(&t);
     timer_freq = t.QuadPart;
 
+    // The multiplication by 1000 or 1000000 below can cause an overflow if timer_freq
+    // and the uptime is high enough.
+    // We subtract the program start time to reduce the likelihood of that happening.
     QueryPerformanceCounter(&t);
     timer_start = t.QuadPart;
 
@@ -558,12 +562,12 @@ void ggml_time_init(void) {
 int64_t ggml_time_ms(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (int64_t) (((double) (t.QuadPart - timer_start) / timer_freq) * 1000);
+    return ((t.QuadPart-timer_start) * 1000) / timer_freq;
 }
 int64_t ggml_time_us(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (int64_t) (((double) (t.QuadPart - timer_start) / timer_freq) * 1000000);
+    return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
 }
 #else
 void ggml_time_init(void) {}
@@ -951,6 +955,226 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    // strixllama: EXL3 trellis (ggml-exl3.c, ranma.cpp, MIT): a block is 128 weights of a row, but rows are only
+    // stored in groups of 128
+    [GGML_TYPE_EXL3_M1] = {
+        .type_name                = "exl3_m1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M2] = {
+        .type_name                = "exl3_m2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M3] = {
+        .type_name                = "exl3_m3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M4] = {
+        .type_name                = "exl3_m4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M5] = {
+        .type_name                = "exl3_m5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M6] = {
+        .type_name                = "exl3_m6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M7] = {
+        .type_name                = "exl3_m7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M8] = {
+        .type_name                = "exl3_m8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M1H] = {
+        .type_name                = "exl3_m1h",
+        .blck_size                = 128,
+        .type_size                = 24,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M2H] = {
+        .type_name                = "exl3_m2h",
+        .blck_size                = 128,
+        .type_size                = 40,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M3H] = {
+        .type_name                = "exl3_m3h",
+        .blck_size                = 128,
+        .type_size                = 56,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G1] = {
+        .type_name                = "exl3_g1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G2] = {
+        .type_name                = "exl3_g2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G3] = {
+        .type_name                = "exl3_g3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G4] = {
+        .type_name                = "exl3_g4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G5] = {
+        .type_name                = "exl3_g5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G6] = {
+        .type_name                = "exl3_g6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G7] = {
+        .type_name                = "exl3_g7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G8] = {
+        .type_name                = "exl3_g8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T1] = {
+        .type_name                = "exl3_t1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T2] = {
+        .type_name                = "exl3_t2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T3] = {
+        .type_name                = "exl3_t3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T4] = {
+        .type_name                = "exl3_t4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T5] = {
+        .type_name                = "exl3_t5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T6] = {
+        .type_name                = "exl3_t6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T7] = {
+        .type_name                = "exl3_t7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T8] = {
+        .type_name                = "exl3_t8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },    // EXL3 row codec (ggml-exl3.c): a row of 160 is an fp16 scale and a ring of 160*bits bits
+    [GGML_TYPE_EXL3R_M1] = {
+        .type_name                = "exl3r_m1",
+        .blck_size                = 160,
+        .type_size                = 22,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m1,
+    },
+    [GGML_TYPE_EXL3R_M2] = {
+        .type_name                = "exl3r_m2",
+        .blck_size                = 160,
+        .type_size                = 42,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m2,
+    },
+    [GGML_TYPE_EXL3R_M3] = {
+        .type_name                = "exl3r_m3",
+        .blck_size                = 160,
+        .type_size                = 62,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m3,
+    },
+    [GGML_TYPE_EXL3R_M4] = {
+        .type_name                = "exl3r_m4",
+        .blck_size                = 160,
+        .type_size                = 82,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m4,
+    },
+    [GGML_TYPE_EXL3R_M5] = {
+        .type_name                = "exl3r_m5",
+        .blck_size                = 160,
+        .type_size                = 102,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m5,
+    },
+    [GGML_TYPE_EXL3R_M6] = {
+        .type_name                = "exl3r_m6",
+        .blck_size                = 160,
+        .type_size                = 122,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m6,
+    },
+    [GGML_TYPE_EXL3R_M7] = {
+        .type_name                = "exl3r_m7",
+        .blck_size                = 160,
+        .type_size                = 142,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m7,
+    },
+    [GGML_TYPE_EXL3R_M8] = {
+        .type_name                = "exl3r_m8",
+        .blck_size                = 160,
+        .type_size                = 162,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m8,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1093,6 +1317,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "QSA_PACK",
+    "MUL_MAT_HAD",
 
     "UNARY",
 
@@ -1110,7 +1336,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1209,6 +1435,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "qsa_pack(x)",
+    "mul_mat_had(a,b)",
 
     "unary(x)",
 
@@ -1226,7 +1454,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3332,6 +3560,7 @@ bool ggml_prec_set_src(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_HAD:
             {
                 if (idx != 1) {
                     return false;
@@ -3346,36 +3575,6 @@ bool ggml_prec_set_src(
     };
 
     return true;
-}
-
-enum ggml_prec ggml_prec_get_acc(
-        const struct ggml_tensor * a) {
-    switch (a->op) {
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-            return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
-        case GGML_OP_FLASH_ATTN_EXT:
-            return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
-        default:
-            return GGML_PREC_UNDEFINED;
-    };
-}
-
-enum ggml_prec ggml_prec_get_src(
-        const struct ggml_tensor * a,
-        int                        idx) {
-    GGML_ASSERT(idx >= 0 && idx < GGML_MAX_SRC);
-
-    switch (a->op) {
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-            if (idx != 1) {
-                return GGML_PREC_UNDEFINED;
-            }
-            return (enum ggml_prec) ggml_get_op_params_i32(a, 2 + idx);
-        default:
-            return GGML_PREC_UNDEFINED;
-    };
 }
 
 // ggml_mul_mat
@@ -3394,6 +3593,8 @@ struct ggml_tensor * ggml_mul_mat(
         struct ggml_tensor  * b) {
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
+    GGML_ASSERT(!ggml_is_exl3(a->type) && "EXL3 weights need ggml_mul_mat_had");
+    GGML_ASSERT(!ggml_is_exl3_row(a->type) && "EXL3 row codec tables are read with ggml_get_rows");
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -3438,8 +3639,6 @@ void ggml_mul_mat_set_hint(
     in b, n_expert_used can be broadcasted to match the n_expert_used of ids
 
     c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
-
-    an id of -1 skips the slot: no matrix is selected, c[:,e,t] is set to zero
 */
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
@@ -3448,6 +3647,8 @@ struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_tensor  * ids) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(!ggml_is_exl3(as->type) && "EXL3 weights need ggml_mul_mat_had");
+    GGML_ASSERT(!ggml_is_exl3_row(as->type) && "EXL3 row codec tables are read with ggml_get_rows");
 
     GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
     GGML_ASSERT(b->ne[3] == 1); // b is 3d
@@ -3464,6 +3665,108 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[1] = b;
     result->src[2] = ids;
 
+    return result;
+}
+
+// ggml_mul_mat_had (strixllama: from ranma.cpp, MIT)
+
+// strixllama: [n, n_exp], or [n, 1]: one rotation shared by all weight matrices
+static bool ggml_mul_mat_had_rot(const struct ggml_tensor * rot, int64_t n, int64_t n_exp) {
+    return (rot->type == GGML_TYPE_F32 || rot->type == GGML_TYPE_F16) && rot->nb[0] == ggml_type_size(rot->type) &&
+        rot->ne[0] == n && (rot->ne[1] == n_exp || rot->ne[1] == 1) && rot->ne[2] == 1 && rot->ne[3] == 1;
+}
+
+// n_exp: the experts the rotations and ids index (a->ne[2], or the classes' total)
+static struct ggml_tensor * ggml_mul_mat_had_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had,
+        int64_t               n_exp) {
+    const int64_t k     = a->ne[0];
+    const int64_t n     = a->ne[1];
+
+    GGML_ASSERT(had >= 2 && had <= 512 && (had & (had - 1)) == 0);
+    GGML_ASSERT(k % had == 0 && n % had == 0);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || ggml_is_exl3(a->type));
+    GGML_ASSERT(a->ne[3] == 1 && a->nb[0] == ggml_type_size(a->type) && a->nb[1] == ggml_row_size(a->type, k) && a->nb[2] >= n*a->nb[1]);
+    if (ggml_is_exl3(a->type)) {
+        // rows are stored in groups of 128, and the group is the H128 output block
+        GGML_ASSERT(had == 128);
+        GGML_ASSERT(a->view_offs % (128*a->nb[1]) == 0 && a->nb[2] % (128*a->nb[1]) == 0);
+    }
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[0] == k);
+    GGML_ASSERT(ggml_mul_mat_had_rot(rot_in, k, n_exp) && ggml_mul_mat_had_rot(rot_out, n, n_exp));
+
+    int64_t ne[4] = { n, b->ne[1], b->ne[2], b->ne[3] };
+    if (ids) {
+        GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+        GGML_ASSERT(ids->ne[1] == b->ne[2] && b->ne[3] == 1);
+        GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+        ne[1] = ids->ne[0];
+    } else {
+        GGML_ASSERT(b->ne[2] % n_exp == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, had);
+
+    // src[2] = ids as in ggml_mul_mat_id, so code that reads the expert ids of an op finds them in the same place
+    result->op     = GGML_OP_MUL_MAT_HAD;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = rot_in;
+    result->src[4] = rot_out;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_had(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had) {
+    return ggml_mul_mat_had_impl(ctx, a, b, rot_in, rot_out, ids, had, a->ne[2]);
+}
+
+struct ggml_tensor * ggml_mul_mat_had_classes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had,
+        struct ggml_tensor  * cmap,
+        struct ggml_tensor  * w1,
+        struct ggml_tensor  * w2) {
+    GGML_ASSERT(ids && cmap && w1 && "per-expert classes need ids, a class map and a second class");
+    GGML_ASSERT(cmap->type == GGML_TYPE_I32 && ggml_is_contiguous(cmap) && cmap->ne[1] == 1 && cmap->ne[2] == 1 && cmap->ne[3] == 1);
+    const int64_t n_exp = cmap->ne[0];
+    int64_t total = 0;
+    struct ggml_tensor * cls[3] = { a, w1, w2 };
+    for (int c = 0; c < 3; ++c) {
+        const struct ggml_tensor * w = cls[c];
+        if (w == NULL) {
+            continue;
+        }
+        GGML_ASSERT(ggml_is_exl3(w->type) && !w->view_src && w->ne[0] == a->ne[0] && w->ne[1] == a->ne[1] && w->ne[3] == 1);
+        GGML_ASSERT(w->nb[1] == ggml_row_size(w->type, w->ne[0]) && w->nb[2] == w->ne[1]*w->nb[1]);
+        total += w->ne[2];
+    }
+    GGML_ASSERT(total == n_exp && n_exp < (1 << 24));
+    struct ggml_tensor * result = ggml_mul_mat_had_impl(ctx, a, b, rot_in, rot_out, ids, had, n_exp);
+    result->src[5] = cmap;
+    result->src[6] = w1;
+    result->src[7] = w2;
     return result;
 }
 
@@ -5620,6 +5923,41 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rows,
+        float                 scale) {
+    GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && v->type == k->type);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[1] == 1 && q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && k->ne[3] == 1 && v->ne[3] == 1 && q->ne[2] % k->ne[1] == 0);
+    GGML_ASSERT(k->nb[1] <= k->nb[2] && v->nb[1] <= v->nb[2]);
+    GGML_ASSERT(mask && mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask));
+    GGML_ASSERT(mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows) && ggml_nelements(rows) == mask->ne[0]*q->ne[3]);
+
+    // what ggml_flash_attn_ext makes of q and a [head, n_sel, n_head_kv, n_seq] K/V
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 3, (int32_t) GGML_PREC_F32);
+    ggml_set_op_params_i32(result, 5, GGML_FLASH_ATTN_EXT_GATHER);
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[8] = rows;
+
+    return result;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -6471,6 +6809,91 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// strixllama: op_params[1] of a GATED_DELTA_NET node - 0 the plain net, 1 with deferred rollback, 2 the replay alone
+struct ggml_tensor * ggml_gated_delta_net_lazy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state_all,
+        struct ggml_tensor  * rec,
+        struct ggml_tensor  * info) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state_all));
+    GGML_ASSERT(ggml_is_contiguous(rec));
+    GGML_ASSERT(ggml_is_contiguous(info));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_all->type == GGML_TYPE_F32 && rec->type == GGML_TYPE_F32 && info->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int64_t H_k      = k->ne[1];
+
+    GGML_ASSERT(g->ne[0] == 1 && beta->ne[0] == 1);          // scalar gate only
+    GGML_ASSERT(k->ne[0] == S_v && q->ne[1] == H_k && H % H_k == 0);
+    GGML_ASSERT(state_all->ne[0] == S_v * S_v * H);
+    GGML_ASSERT(rec->ne[0] == H * S_v + H_k * S_v + H && rec->ne[1] >= n_tokens);
+    GGML_ASSERT(info->ne[0] == 5 && info->ne[1] == n_seqs);
+
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, 1);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state_all;
+    result->src[6] = rec;
+    result->src[7] = info;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * state_all,
+        struct ggml_tensor  * rec,
+        struct ggml_tensor  * info,
+        int                   S_v,
+        int                   H_v,
+        int                   H_k) {
+    GGML_ASSERT(state_all->type == GGML_TYPE_F32 && rec->type == GGML_TYPE_F32 && info->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(state_all) && ggml_is_contiguous(rec) && ggml_is_contiguous(info));
+    GGML_ASSERT(state_all->ne[0] == (int64_t) S_v * S_v * H_v);
+    GGML_ASSERT(rec->ne[0] == (int64_t) H_v * S_v + (int64_t) H_k * S_v + H_v);
+    GGML_ASSERT(info->ne[0] == 5);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, state_all);
+
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, 2);
+    ggml_set_op_params_i32(result, 2, S_v);
+    ggml_set_op_params_i32(result, 3, H_v);
+    ggml_set_op_params_i32(result, 4, H_k);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[5] = state_all;
+    result->src[6] = rec;
+    result->src[7] = info;
+
+    return result;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
@@ -6699,6 +7122,29 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_qsa_pack
+
+struct ggml_tensor * ggml_qsa_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cache,
+        bool                  values) {
+    GGML_ASSERT(cache->type == GGML_TYPE_F16 || cache->type == GGML_TYPE_Q8_0 || cache->type == GGML_TYPE_Q5_1);
+    GGML_ASSERT(cache->ne[0] == 256 && cache->ne[2] % 4 == 0 && cache->ne[3] == 1);
+    GGML_ASSERT(cache->nb[0] == ggml_type_size(cache->type) && cache->nb[1] >= ggml_row_size(cache->type, 256));
+
+    const int64_t N = cache->ne[1] * (cache->ne[2] / 4);   // heads x blocks of four cells
+    struct ggml_tensor * result = values
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 4, 256, N)
+        : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 4, 16, N);
+
+    ggml_set_op_params_i32(result, 0, values ? 1 : 0);
+
+    result->op     = GGML_OP_QSA_PACK;
+    result->src[0] = cache;
 
     return result;
 }

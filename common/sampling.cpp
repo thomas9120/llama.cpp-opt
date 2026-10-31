@@ -8,13 +8,19 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -125,6 +131,9 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // strixllama: the model's vocabulary, for the fast top-k of a stored row (common_sampler_sample_logits)
+    const llama_vocab * vocab = nullptr;
+
     void reset() {
         prev.clear();
 
@@ -160,6 +169,16 @@ struct common_sampler {
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
             }
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // strixllama: the candidates from a stored row of logits (see common_sampler_sample_logits)
+    void set_logits_row(const float * logits, int n_vocab) {
+        cur.resize(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
@@ -442,6 +461,7 @@ struct common_sampler * common_sampler_init(
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
+    result->vocab = vocab;
 
     return result;
 }
@@ -516,7 +536,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -526,6 +546,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
     };
+    result->vocab = gsmpl->vocab;
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -603,6 +625,217 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// strixllama: exact fast top-k sampling (see common_sampler_sample). The chain index of its top-k sampler when every
+// sampler before it is the logit bias or a no-op under these parameters, else -1.
+static int common_sampler_fast_topk_index(const common_sampler * gsmpl) {
+    const auto & pr = gsmpl->params;
+    if (pr.mirostat != 0 || pr.top_k <= 0 || pr.top_k > 128) {
+        return -1;
+    }
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    for (int i = 0; i < n; ++i) {
+        const char * name = llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, i));
+        if (strcmp(name, "top-k") == 0) {
+            return i;
+        }
+        if (name[0] == '?') {
+            continue;   // llama_sampler_init_empty: a sampler its parameters make a no-op (no apply)
+        }
+        if (strcmp(name, "logit-bias") == 0) {
+            continue;
+        }
+        if (strcmp(name, "penalties") == 0 && (pr.penalty_last_n == 0 ||
+                (pr.penalty_repeat == 1.0f && pr.penalty_freq == 0.0f && pr.penalty_present == 0.0f))) {
+            continue;
+        }
+        if (strcmp(name, "dry") == 0 && (pr.dry_multiplier == 0.0f || pr.dry_base < 1.0f || pr.dry_penalty_last_n == 0)) {
+            continue;
+        }
+        if (strcmp(name, "top-n-sigma") == 0 && pr.top_n_sigma <= 0.0f) {
+            continue;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+// the k + 1 largest logits after the logit bias (the user's biases, then the vocabulary's suppressed tokens, in the
+// order common_sampler_init merged them), strictly decreasing, into cur as top-k leaves the first k; false (nothing
+// changed) on a tie, a NaN or fewer than k + 1 tokens
+static bool common_sampler_fast_candidates(common_sampler * gsmpl, const llama_vocab * vocab, const float * logits,
+        const int n_vocab, const int k) {
+    std::vector<llama_logit_bias> merged = gsmpl->params.logit_bias;
+    int32_t n_suppress = 0;
+    const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    for (int32_t i = 0; i < n_suppress; ++i) {
+        merged.push_back({ suppress[i], -INFINITY });
+    }
+    // the biased value of each biased token, the biases added in list order as llama_sampler_logit_bias_apply does
+    std::vector<std::pair<llama_token, float>> biased;
+    for (const auto & lb : merged) {
+        if (lb.token < 0 || lb.token >= n_vocab) {
+            return false;   // the bias sampler would search the array for it
+        }
+        bool found = false;
+        for (auto & b : biased) {
+            if (b.first == lb.token) {
+                b.second += lb.bias;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            biased.push_back({ lb.token, logits[lb.token] + lb.bias });
+        }
+    }
+    std::sort(biased.begin(), biased.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+
+    const int m = k + 1;
+    if (n_vocab < m) {
+        return false;
+    }
+    float tv[129 + 1];
+    llama_token ti[129 + 1];
+    int cnt = 0;
+    size_t bi = 0;
+    for (llama_token t = 0; t < n_vocab; ++t) {
+#if defined(__SSE2__)
+        // once the k + 1 slots are full, eight tokens at a time: a block with no biased token, no NaN and no logit
+        // above the current (k + 1)-th holds only tokens the loop below skips (the threshold only rises), so it is
+        // skipped whole; a block with a hit is read one token at a time. 248K logits a row: ~6x shorter
+        if (cnt == m && (t & 7) == 0) {
+            const llama_token next_b = bi < biased.size() ? biased[bi].first : n_vocab;
+            const __m128 thr = _mm_set1_ps(tv[m - 1]);
+            while (t + 8 <= n_vocab && t + 8 <= next_b) {
+                const __m128 a = _mm_loadu_ps(logits + t), b = _mm_loadu_ps(logits + t + 4);
+                const __m128 hit = _mm_or_ps(_mm_or_ps(_mm_cmpgt_ps(a, thr), _mm_cmpunord_ps(a, a)),
+                                             _mm_or_ps(_mm_cmpgt_ps(b, thr), _mm_cmpunord_ps(b, b)));
+                if (_mm_movemask_ps(hit)) {
+                    break;
+                }
+                t += 8;
+            }
+            if (t >= n_vocab) {
+                break;
+            }
+        }
+#endif
+        float v = logits[t];
+        if (bi < biased.size() && biased[bi].first == t) {
+            v = biased[bi].second;
+            ++bi;
+        }
+        if (v != v) {
+            return false;   // NaN
+        }
+        if (cnt == m && !(v > tv[m - 1])) {
+            continue;
+        }
+        // insert in descending order; an equal value goes after the ones already there (ties are rejected below)
+        int j = cnt < m ? cnt++ : m - 1;
+        while (j > 0 && tv[j - 1] < v) {
+            tv[j] = tv[j - 1];
+            ti[j] = ti[j - 1];
+            --j;
+        }
+        tv[j] = v;
+        ti[j] = t;
+    }
+    for (int j = 1; j < m; ++j) {
+        if (!(tv[j - 1] > tv[j])) {
+            return false;   // a tie among the k + 1: partial_sort's order or choice could differ
+        }
+    }
+    auto & cur = gsmpl->cur;
+    cur.resize(k);
+    for (int j = 0; j < k; ++j) {
+        cur[j] = llama_token_data{ ti[j], tv[j], 0.0f };
+    }
+    gsmpl->cur_p = { cur.data(), (size_t) k, -1, true };
+    return true;
+}
+
+// strixllama: exact fast top-k (common_sampler_fast_candidates): the chain from its top-k on, on the k candidates.
+// LLAMA_TOKEN_NULL where it does not apply (the caller runs the full path). get_logits: the row; set_full: the full
+// candidates, for the resampling after a grammar rejected the token
+template <typename G, typename S>
+static llama_token common_sampler_sample_fast(common_sampler * gsmpl, const llama_vocab * vocab, const int n_vocab,
+        const bool grammar_first, G && get_logits, S && set_full) {
+    static const bool fast_env = !getenv("STRIX_FAST_SAMPLE") || atoi(getenv("STRIX_FAST_SAMPLE")) != 0;
+    static const bool check_env = getenv("STRIX_FAST_SAMPLE_CHECK") && atoi(getenv("STRIX_FAST_SAMPLE_CHECK")) != 0;
+    auto & grmr    = gsmpl->grmr;
+    auto & rbudget = gsmpl->rbudget;
+    auto & chain   = gsmpl->chain;
+    auto & cur_p   = gsmpl->cur_p;
+    const int ik = fast_env ? common_sampler_fast_topk_index(gsmpl) : -1;
+    if (ik < 0 || (grammar_first && grammar_should_apply(gsmpl)) ||
+            (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const float * logits = get_logits();
+    if (!logits) {
+        return LLAMA_TOKEN_NULL;
+    }
+    // the check: the full path on a clone of the chain (its RNG state included) before the fast one draws
+    llama_token ref_id = LLAMA_TOKEN_NULL;
+    std::vector<llama_token_data> ref_cur;
+    if (check_env) {
+        llama_sampler * ref = llama_sampler_clone(chain);
+        std::vector<llama_token_data> full(n_vocab);
+        for (llama_token t = 0; t < n_vocab; ++t) {
+            full[t] = llama_token_data{ t, logits[t], 0.0f };
+        }
+        llama_token_data_array fp = { full.data(), full.size(), -1, false };
+        llama_sampler_apply(ref, &fp);
+        ref_id = fp.data[fp.selected].id;
+        ref_cur.assign(fp.data, fp.data + fp.size);
+        llama_sampler_free(ref);
+    }
+    if (!common_sampler_fast_candidates(gsmpl, vocab, logits, n_vocab, gsmpl->params.top_k)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const int n = llama_sampler_chain_n(chain);
+    for (int i = ik + 1; i < n; ++i) {
+        llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
+    }
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+    const llama_token id = cur_p.data[cur_p.selected].id;
+    if (check_env && ref_id != LLAMA_TOKEN_NULL) {
+        bool same = ref_id == id && ref_cur.size() == cur_p.size;
+        for (size_t i = 0; same && i < cur_p.size; ++i) {
+            same = ref_cur[i].id == cur_p.data[i].id && memcmp(&ref_cur[i].logit, &cur_p.data[i].logit, sizeof(float)) == 0 &&
+                memcmp(&ref_cur[i].p, &cur_p.data[i].p, sizeof(float)) == 0;
+        }
+        static std::atomic<long long> checked{0};   // the server samples rows on several threads
+        if (!same) {
+            fprintf(stderr, "FAST_SAMPLE_CHECK mismatch after %lld: fast %d (%zu candidates) full %d (%zu)\n",
+                (long long) checked, id, cur_p.size, ref_id, ref_cur.size());
+            GGML_ABORT("fast sampling differs from the full path");
+        }
+        if (++checked % 1000 == 0) {
+            fprintf(stderr, "FAST_SAMPLE_CHECK %lld samples identical\n", (long long) checked);
+        }
+    }
+    if (grammar_first || !grammar_should_apply(gsmpl)) {
+        return id;
+    }
+    // the grammar-based rejection check and the full resampling, as after the full path
+    llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+    llama_sampler_apply(grmr, &single_token_data_array);
+    if (single_token_data_array.data[0].logit != -INFINITY) {
+        return id;
+    }
+    set_full();
+    llama_sampler_apply(rbudget, &cur_p);
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+    llama_sampler_apply(chain, &cur_p);
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+    return cur_p.data[cur_p.selected].id;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -615,6 +848,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // strixllama: exact fast top-k (common_sampler_sample_fast), unless a backend sampler has made this row's candidates
+    if (llama_get_sampled_probs_ith(ctx, idx) == nullptr && llama_get_sampled_logits_ith(ctx, idx) == nullptr &&
+            llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+        id = common_sampler_sample_fast(gsmpl, vocab, llama_vocab_n_tokens(vocab), grammar_first,
+                                        [&] { return llama_get_logits_ith(ctx, idx); }, [&] { gsmpl->set_logits(ctx, idx); });
+        if (id != LLAMA_TOKEN_NULL) {
+            return id;
+        }
+    }
 
     gsmpl->set_logits(ctx, idx);
 
@@ -687,6 +931,71 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+bool common_sampler_fast_applies(const struct common_sampler * gsmpl) {
+    static const bool fast_env = !getenv("STRIX_FAST_SAMPLE") || atoi(getenv("STRIX_FAST_SAMPLE")) != 0;
+    return fast_env && gsmpl && common_sampler_fast_topk_index(gsmpl) >= 0 &&
+        !(gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING);
+}
+
+llama_token common_sampler_sample_logits(struct common_sampler * gsmpl, const float * logits, int n_vocab, bool grammar_first) {
+    const auto tm = gsmpl->tm();
+
+    auto & grmr    = gsmpl->grmr;
+    auto & rbudget = gsmpl->rbudget;
+    auto & chain   = gsmpl->chain;
+    auto & cur_p   = gsmpl->cur_p; // initialized by set_logits_row
+
+    if (gsmpl->vocab) {
+        const llama_token id = common_sampler_sample_fast(gsmpl, gsmpl->vocab, n_vocab, grammar_first, [&] { return logits; },
+                                                          [&] { gsmpl->set_logits_row(logits, n_vocab); });
+        if (id != LLAMA_TOKEN_NULL) {
+            return id;
+        }
+    }
+
+    gsmpl->set_logits_row(logits, n_vocab);
+
+    llama_sampler_apply(rbudget, &cur_p);
+
+    if (grammar_first && grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    llama_token id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first || !grammar_should_apply(gsmpl)) {
+        return id;
+    }
+
+    // the grammar-based rejection sampling of common_sampler_sample
+    {
+        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(grmr, &single_token_data_array);
+
+        if (single_token_data_array.data[0].logit != -INFINITY) {
+            return id;
+        }
+    }
+
+    gsmpl->set_logits_row(logits, n_vocab);
+
+    llama_sampler_apply(rbudget, &cur_p);
+
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -695,9 +1004,40 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
+    // strixllama (dev): STRIX_SAMPLE_DUMP=1 prints each verified row's top logits, its draft token and the sample
+    static const bool dump = getenv("STRIX_SAMPLE_DUMP") && atoi(getenv("STRIX_SAMPLE_DUMP")) != 0;
+    auto dump_row = [&](const size_t r, const llama_token id) {
+        if (!dump) {
+            return;
+        }
+        const float * lg = llama_get_logits_ith(ctx, idxs[r]);
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<std::pair<float, int>> top;
+        for (int t = 0; t < n_vocab; ++t) {
+            if (top.size() < 6 || lg[t] > top.back().first) {
+                top.emplace_back(lg[t], t);
+                std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+                if (top.size() > 6) {
+                    top.pop_back();
+                }
+            }
+        }
+        double s = 0.0;
+        for (int t = 0; t < n_vocab; ++t) {
+            s += lg[t];
+        }
+        fprintf(stderr, "SAMPLE_DUMP rows %zu r %zu idx %d draft %d sampled %d (logit %.3f) mean %.4f top", idxs.size(), r, idxs[r],
+                r < draft.size() ? draft[r] : -1, id, lg[id], s / n_vocab);
+        for (const auto & p : top) {
+            fprintf(stderr, " %d:%.3f", p.second, p.first);
+        }
+        fprintf(stderr, "\n");
+    };
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        dump_row(i, id);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -712,6 +1052,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        dump_row(i, id);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -846,6 +1187,395 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+bool common_sampler_spec_supported(const struct common_sampler * gsmpl) {
+    if (!gsmpl || gsmpl->params.temp <= 0.0f || gsmpl->params.mirostat != 0 || gsmpl->params.backend_sampling) {
+        return false;
+    }
+
+    // the chain ends in dist, and what comes before it is a function of the logits and the accepted tokens (xtc's own
+    // draws as well: they are independent of the draft)
+    static const char * known[] = {
+        "logit-bias", "penalties", "dry", "top-n-sigma", "top-k", "typical", "top-p", "min-p", "xtc", "temp", "temp-ext",
+    };
+
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    if (n < 1 || std::strcmp(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, n - 1)), "dist") != 0) {
+        return false;
+    }
+    for (int i = 0; i + 1 < n; ++i) {
+        const char * name = llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, i));
+        if (name[0] == '?') {
+            continue; // a sampler its parameters turned off: an empty one in its place
+        }
+        bool ok = false;
+        for (const char * k : known) {
+            ok = ok || std::strcmp(name, k) == 0;
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// the distribution common_sampler_sample draws from at idx: the reasoning budget, the chain's samplers but its last
+// (dist), then dist's softmax; cur_p holds it, its p normalized as dist leaves them
+static void spec_target_probs(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    gsmpl->set_logits(ctx, idx);
+
+    auto & cur_p = gsmpl->cur_p;
+
+    llama_sampler_apply(gsmpl->rbudget, &cur_p);
+
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    for (int i = 0; i + 1 < n; ++i) {
+        llama_sampler * smpl = llama_sampler_chain_get(gsmpl->chain, i);
+        if (smpl->iface->apply != nullptr) {
+            llama_sampler_apply(smpl, &cur_p);
+        }
+    }
+
+    GGML_ASSERT(cur_p.size > 0 && "no candidates left to sample from - check your sampling configuration");
+
+    float max_l = cur_p.data[0].logit;
+    for (size_t i = 1; i < cur_p.size; ++i) {
+        max_l = std::max(max_l, cur_p.data[i].logit);
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        const float e = expf(cur_p.data[i].logit - max_l);
+        cur_p.data[i].p = e;
+        sum += e;
+    }
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        cur_p.data[i].p /= sum;
+    }
+
+    cur_p.selected = -1;
+}
+
+// an index of cur_p drawn with probabilities proportional to w (non-negative, not all zero)
+static size_t spec_draw(const std::vector<double> & w, std::mt19937 & rng) {
+    double sum = 0.0;
+    for (const double x : w) {
+        sum += x;
+    }
+
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    const double u = unif(rng) * sum;
+
+    double cum  = 0.0;
+    size_t last = 0;
+    for (size_t i = 0; i < w.size(); ++i) {
+        if (w[i] > 0.0) {
+            cum += w[i];
+            last = i;
+            if (cum > u) {
+                return i;
+            }
+        }
+    }
+
+    return last;
+}
+
+static double spec_q_of(const std::vector<llama_token_data> & q, llama_token id) {
+    for (const auto & e : q) {
+        if (e.id == id) {
+            return e.p;
+        }
+    }
+    return 0.0;
+}
+
+llama_token common_sampler_spec_draw_q(const llama_token_data_array * cands, float temp, int32_t top_k, float top_p, float min_p,
+        float qscale, std::mt19937 & rng, std::vector<llama_token_data> & q) {
+    size_t n = 0;
+    while (n < cands->size && std::isfinite(cands->data[n].logit)) {
+        n++;
+    }
+    if (top_k > 0) {
+        n = std::min(n, (size_t) top_k);
+    }
+    GGML_ASSERT(n > 0);
+
+    const double l0 = cands->data[0].logit;
+
+    std::vector<double> p1(n);
+    double sum1 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        p1[i] = std::exp((double) cands->data[i].logit - l0);
+        sum1 += p1[i];
+    }
+
+    size_t keep = n;
+    if (top_p < 1.0f) {
+        double cum = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            cum += p1[i] / sum1;
+            if (cum >= top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+    if (min_p > 0.0f) {
+        // relative to the top token's (p1[0] == 1)
+        for (size_t i = 1; i < keep; ++i) {
+            if (p1[i] < min_p) {
+                keep = i;
+                break;
+            }
+        }
+    }
+
+    const double t = (double) temp * std::max(qscale, 1e-3f);
+
+    std::vector<double> w(keep);
+    double sum = 0.0;
+    for (size_t i = 0; i < keep; ++i) {
+        w[i] = std::exp(((double) cands->data[i].logit - l0) / t);
+        sum += w[i];
+    }
+
+    q.resize(keep);
+    for (size_t i = 0; i < keep; ++i) {
+        q[i] = { cands->data[i].id, cands->data[i].logit, (float) (w[i] / sum) };
+        w[i] = q[i].p;
+    }
+
+    // drawn from q as recorded
+    return q[spec_draw(w, rng)].id;
+}
+
+// one position of the verification, cur_p holding p (normalized): with a draft token x drawn from q, x accepted with
+// probability min(1, p(x) / q(x)), else a draw from max(0, p - q) and the draft ends (*stop); without a draft token
+// (q == nullptr), a draw from p. Returns an index into cur_p
+static size_t spec_select(const llama_token_data_array & cur_p, const std::vector<llama_token_data> * q, llama_token x,
+        std::mt19937 & rng, std::vector<double> & w, bool * stop) {
+    w.resize(cur_p.size);
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        w[j] = cur_p.data[j].p;
+    }
+
+    *stop = q == nullptr;
+    if (q == nullptr) {
+        return spec_draw(w, rng);
+    }
+
+    const double qx = spec_q_of(*q, x);
+
+    int    jx = -1;
+    double px = 0.0;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        if (cur_p.data[j].id == x) {
+            jx = (int) j;
+            px = w[j];
+            break;
+        }
+    }
+
+    if (qx <= 0.0) {
+        // not drawn from q (no q for it): an exact match with a draw from p, which is always right
+        const size_t sel = spec_draw(w, rng);
+        *stop = cur_p.data[sel].id != x;
+        return sel;
+    }
+
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    if (jx >= 0 && unif(rng) * qx < px) {
+        return (size_t) jx;
+    }
+
+    // rejected (so p(x) < q(x)): a draw from max(0, p - q), which is zero at x
+    double sum = 0.0;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        const double r = w[j] - spec_q_of(*q, cur_p.data[j].id);
+        w[j] = r > 0.0 ? r : 0.0;
+        sum += w[j];
+    }
+    if (!(sum > 0.0)) {
+        // p and q equal to rounding: p itself
+        for (size_t j = 0; j < cur_p.size; ++j) {
+            w[j] = cur_p.data[j].p;
+        }
+    }
+
+    *stop = true;
+    return spec_draw(w, rng);
+}
+
+// STRIX_SPEC_SAMPLING_STATS=1 (measurement only): at every verified draft position, the expected acceptance
+// sum_y min(p(y), q'(y)) of q' = q's support at other temperatures (q's logits / (temp * s)) and of the greedy draft
+// (p of q's top token), printed every 256 first positions. A first position's numbers hold for any s; a later one's
+// are conditional on the prefixes the draft actually drew.
+struct spec_stats {
+    static constexpr int    N_POS    = 8;
+    static constexpr int    N_SCALES = 9;
+    static constexpr double scales[N_SCALES] = { 0.0, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0, 1.15, 1.3 };
+
+    std::mutex mtx;
+    int64_t n     [N_POS] = {};
+    double  e     [N_POS][N_SCALES] = {};
+    double  e_used[N_POS] = {};
+    int64_t n_acc [N_POS] = {};
+
+    static bool enabled() {
+        static const bool on = getenv("STRIX_SPEC_SAMPLING_STATS") && atoi(getenv("STRIX_SPEC_SAMPLING_STATS")) != 0;
+        return on;
+    }
+
+    void add(int pos, const llama_token_data_array & cur_p, const std::vector<llama_token_data> & q, float temp, bool accepted) {
+        if (pos >= N_POS || q.empty()) {
+            return;
+        }
+
+        std::vector<double> pq(q.size(), 0.0);
+        for (size_t k = 0; k < q.size(); ++k) {
+            for (size_t j = 0; j < cur_p.size; ++j) {
+                if (cur_p.data[j].id == q[k].id) {
+                    pq[k] = cur_p.data[j].p;
+                    break;
+                }
+            }
+        }
+
+        size_t k_top = 0;
+        for (size_t k = 1; k < q.size(); ++k) {
+            if (q[k].logit > q[k_top].logit) {
+                k_top = k;
+            }
+        }
+
+        double es[N_SCALES];
+        for (int s = 0; s < N_SCALES; ++s) {
+            if (scales[s] <= 0.0) {
+                es[s] = pq[k_top];
+                continue;
+            }
+            const double t = (double) temp * scales[s];
+            double sum = 0.0;
+            std::vector<double> w(q.size());
+            for (size_t k = 0; k < q.size(); ++k) {
+                w[k] = std::exp(((double) q[k].logit - (double) q[k_top].logit) / t);
+                sum += w[k];
+            }
+            es[s] = 0.0;
+            for (size_t k = 0; k < q.size(); ++k) {
+                es[s] += std::min(pq[k], w[k] / sum);
+            }
+        }
+
+        double eu = 0.0;
+        for (size_t k = 0; k < q.size(); ++k) {
+            eu += std::min(pq[k], (double) q[k].p);
+        }
+
+        std::lock_guard<std::mutex> lock(mtx);
+
+        n[pos]++;
+        n_acc[pos] += accepted ? 1 : 0;
+        e_used[pos] += eu;
+        for (int s = 0; s < N_SCALES; ++s) {
+            e[pos][s] += es[s];
+        }
+
+        if (pos == 0 && n[0] % 256 == 0) {
+            for (int i = 0; i < N_POS && n[i] > 0; ++i) {
+                std::string line;
+                for (int s = 0; s < N_SCALES; ++s) {
+                    line += string_format(" %s%.3f", s == 0 ? "greedy " : string_format("s%.2f ", scales[s]).c_str(), e[i][s] / n[i]);
+                }
+                LOG_INF("spec stats: pos %d n %6lld accepted %.3f (expected %.3f) |%s\n", i, (long long) n[i],
+                        (double) n_acc[i] / n[i], e_used[i] / n[i], line.c_str());
+            }
+        }
+    }
+};
+
+static spec_stats g_spec_stats;
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_spec(
+        struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, std::mt19937 & rng, bool is_replay) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT((is_replay || draft_q.size() >= draft.size()) && "every draft token needs its q");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    llama_synchronize(ctx);
+
+    auto & cur_p = gsmpl->cur_p;
+
+    std::vector<double> w;
+
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        const bool has_draft = i < draft.size();
+
+        if (is_replay && has_draft) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        llama_token id   = LLAMA_TOKEN_NULL;
+        bool        stop = true;
+
+        {
+            const auto tm = gsmpl->tm();
+
+            spec_target_probs(gsmpl, ctx, idxs[i]);
+
+            const size_t sel = spec_select(cur_p, has_draft ? &draft_q[i] : nullptr, has_draft ? draft[i] : LLAMA_TOKEN_NULL,
+                    rng, w, &stop);
+
+            if (has_draft && spec_stats::enabled()) {
+                g_spec_stats.add((int) i, cur_p, draft_q[i], gsmpl->params.temp, !stop && cur_p.data[sel].id == draft[i]);
+            }
+
+            cur_p.selected = (int64_t) sel;
+            id = cur_p.data[sel].id;
+        }
+
+        // the grammar-based rejection sampling of common_sampler_sample: a token the grammar rejects is replaced by a
+        // draw from the chain applied after the grammar, which is what common_sampler_sample returns after drawing it
+        if (grammar_should_apply(gsmpl)) {
+            const auto tm = gsmpl->tm();
+
+            llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+            llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+            llama_sampler_apply(gsmpl->grmr, &single_token_data_array);
+
+            if (single_token_data_array.data[0].logit == -INFINITY) {
+                gsmpl->set_logits(ctx, idxs[i]);
+
+                llama_sampler_apply(gsmpl->rbudget, &cur_p);
+                llama_sampler_apply(gsmpl->grmr,    &cur_p);
+                llama_sampler_apply(gsmpl->chain,   &cur_p);
+
+                GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+                id   = cur_p.data[cur_p.selected].id;
+                stop = true;
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+
+        if (stop || id != draft[i]) {
+            break;
+        }
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

@@ -40,18 +40,18 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
     const uint32_t q_odd  = (q4 >> 4);
 
     // Perform lookups in the lower half of the table (indices 0-7).
-    uint32_t v_even_low = ggml_hip_perm(values[1], values[0], q_even & 0x07070707);
-    uint32_t v_odd_low  = ggml_hip_perm(values[1], values[0], q_odd & 0x07070707);
+    uint32_t v_even_low = __builtin_amdgcn_perm(values[1], values[0], q_even & 0x07070707);
+    uint32_t v_odd_low = __builtin_amdgcn_perm(values[1], values[0], q_odd & 0x07070707);
 
     // Perform lookups in the upper half of the table (indices 8-15).
-    uint32_t v_even_high = ggml_hip_perm(values[3], values[2], q_even & 0x07070707);
-    uint32_t v_odd_high  = ggml_hip_perm(values[3], values[2], q_odd & 0x07070707);
+    uint32_t v_even_high = __builtin_amdgcn_perm(values[3], values[2], q_even & 0x07070707);
+    uint32_t v_odd_high = __builtin_amdgcn_perm(values[3], values[2], q_odd & 0x07070707);
 
     // Select between the low and high results based on the MSB of each index nibble.
     uint32_t mask_even = 0x03020100 | ((q_even & 0x08080808) >> 1);
-    uint32_t res_x     = ggml_hip_perm(v_even_high, v_even_low, mask_even);
+    uint32_t res_x = __builtin_amdgcn_perm(v_even_high, v_even_low, mask_even);
     uint32_t mask_odd = 0x03020100 | ((q_odd & 0x08080808) >> 1);
-    uint32_t res_y     = ggml_hip_perm(v_odd_high, v_odd_low, mask_odd);
+    uint32_t res_y = __builtin_amdgcn_perm(v_odd_high, v_odd_low, mask_odd);
 
     return make_int2(res_x, res_y);
 #elif !defined(GGML_USE_MUSA)
@@ -621,10 +621,40 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
+#if defined(GGML_USE_HIP) && !defined(STRIX_MMVQ_VDR2)
+#define VDR_Q6_K_Q8_1_MMVQ 1
+#else
 #define VDR_Q6_K_Q8_1_MMVQ 2
+#endif
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
+// strixllama: on HIP the VDR 1 form of 0.6.x: upstream's VDR 2 form (#30517) measured +-1% on gfx1151 for Q6_K, and
+// VDR 1 keeps the UD head and the EXL3 draft's own head (Q6_K) bitwise 0.6.x. STRIX_MMVQ_VDR2 (a build define)
+// selects VDR 2
+#if defined(GGML_USE_HIP) && !defined(STRIX_MMVQ_VDR2)
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+    const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
+    const float & d, const float * __restrict__ d8) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int sc = scales[4*i];
+
+        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+
+        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+    }
+
+    return d*sumf;
+}
+#else
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
     const float & d, const float * __restrict__ d8) {
@@ -651,6 +681,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
     return d*sumf;
 }
+#endif // defined(GGML_USE_HIP)
 
 // contiguous v/x + u/y values
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
@@ -720,10 +751,10 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         const uint32_t q2_indices = (q2_bits & 0x01) | ((q2_bits & 0x02) << 7) | ((q2_bits & 0x04) << 14) | ((q2_bits & 0x08) << 21);
         const uint32_t q3_indices = (q3_bits & 0x01) | ((q3_bits & 0x02) << 7) | ((q3_bits & 0x04) << 14) | ((q3_bits & 0x08) << 21);
 
-        const int v0 = ggml_hip_perm(0x000001FF, 0x000001FF, q0_indices);
-        const int v1 = ggml_hip_perm(0x000001FF, 0x000001FF, q1_indices);
-        const int v2 = ggml_hip_perm(0x000001FF, 0x000001FF, q2_indices);
-        const int v3 = ggml_hip_perm(0x000001FF, 0x000001FF, q3_indices);
+        const int v0 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q0_indices);
+        const int v1 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q1_indices);
+        const int v2 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q2_indices);
+        const int v3 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q3_indices);
 #else
         // unpack crumbs into nibble indices
         const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
@@ -777,8 +808,8 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
         const uint32_t qy_bits    = q >> 8;
         const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
-        const int      qx         = ggml_hip_perm(0x020100FF, 0x020100FF, qx_indices);
-        const int      qy         = ggml_hip_perm(0x020100FF, 0x020100FF, qy_indices);
+        const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
+        const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
 #else
         // unpack even and odd crumbs into byte values
         const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
@@ -1071,6 +1102,36 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+// strixllama: on HIP the VDR 1 form of 0.6.x: upstream's VDR 2 form (#30517) measured +-1% on gfx1151 for Q6_K, and
+// VDR 1 keeps the UD head and the EXL3 draft's own head (Q6_K) bitwise 0.6.x. STRIX_MMVQ_VDR2 (a build define)
+// selects VDR 2
+#if defined(GGML_USE_HIP) && !defined(STRIX_MMVQ_VDR2)
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u[QR6_K];
+    float d8[QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+    }
+
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+}
+#else
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1104,6 +1165,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
+#endif // defined(GGML_USE_HIP)
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2
@@ -1267,6 +1329,15 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     return d * sumi;
 }
 
+#if defined(GGML_USE_HIP)
+// strixllama: 0xFF in byte i when sign bit i of the 4-bit half `s4` is set, for the 4-weight halves of
+// an IQ3_S sign byte. Two multiplies and an and, no table: s4 * 0x00204081 puts bit i at position
+// 8*i (plus stray copies the mask removes), and * 0xFF spreads each kept bit over its byte.
+static __device__ __forceinline__ uint32_t strixllama_iq3s_sign_mask(const uint32_t s4) {
+    return ((s4 * 0x00204081u) & 0x01010101u) * 0xFFu;
+}
+#endif
+
 #define VDR_IQ3_S_Q8_1_MMVQ 2
 #define VDR_IQ3_S_Q8_1_MMQ  2
 
@@ -1291,17 +1362,27 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+#if defined(GGML_USE_HIP)
+        // strixllama: __vcmpne4 / __vsub4 are byte loops on HIP. The grid magnitudes are positive, so split
+        // each word by the sign mask and take two native dp4a instead: identical integer result.
+        const uint32_t m0 = strixllama_iq3s_sign_mask(signs_packed_8[l0/2] & 0x0F);
+        const uint32_t m1 = strixllama_iq3s_sign_mask(signs_packed_8[l0/2] >> 4);
+        sumi  = ggml_cuda_dp4a((int) ((uint32_t) grid_pos.x & ~m0), u0, sumi);
+        sumi -= ggml_cuda_dp4a((int) ((uint32_t) grid_pos.x &  m0), u0, 0);
+        sumi  = ggml_cuda_dp4a((int) ((uint32_t) grid_pos.y & ~m1), u1, sumi);
+        sumi -= ggml_cuda_dp4a((int) ((uint32_t) grid_pos.y &  m1), u1, 0);
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
 
-        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
-
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+#endif
     }
 
     sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);

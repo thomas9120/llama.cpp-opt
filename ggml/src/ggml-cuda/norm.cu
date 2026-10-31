@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "norm-gated.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -413,7 +414,10 @@ static void rms_norm_f32_dispatch(
     const float * add = add_t ? (const float *) add_t->data : nullptr;
 
     // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
-    bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
+    // strixllama: the float4 variants sum in another order; off unless STRIX_RMS_VEC=1, so the norms stay bitwise those
+    // of 0.6.4 and before (measure before turning it on)
+    static const bool vec_ok = [] { const char * e = getenv("STRIX_RMS_VEC"); return e != nullptr && atoi(e) != 0; }();
+    bool vec = vec_ok && ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
     vec = vec && ggml_cuda_is_aligned(x_t, 16);
     if constexpr (do_multiply) {
         vec = vec && mul_ncols_packed.z == (uint32_t) ncols
@@ -455,6 +459,11 @@ static void rms_norm_f32_cuda(
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
         const float scale_out = 1.0f) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+    // strixllama: narrow rows (the per-head norms) a wave each, 8 rows a block - bitwise this kernel's result
+    if (!do_scale && ggml_cuda_rms_rows_plain((const float *) x_t->data, dst, ncols, nrows, nchannels, nsamples,
+                                              stride_row, stride_channel, stride_sample, eps, stream)) {
+        return;
+    }
     rms_norm_f32_dispatch</*do_multiply*/false, /*do_add*/false, do_scale>(
         blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),

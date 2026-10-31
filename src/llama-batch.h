@@ -76,10 +76,29 @@ struct llama_ubatch {
         std::vector<int32_t>        decision_order;
 
         std::vector<llama_seq_id> seq_id_data;
+
+        std::vector<uint32_t> seq_ntok;          // strixllama: ragged ubatches, see below
+        std::vector<uint32_t> seq_tok0;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // strixllama: a ragged ubatch (split_ragged) gives its sequence sets different token counts: set s owns the
+    // tokens [seq_tok0[s], seq_tok0[s] + seq_ntok[s]), sets of one count next to each other, and n_seq_tokens is 0.
+    // Every other ubatch leaves these null, and set s owns n_seq_tokens tokens from s*n_seq_tokens.
+    const uint32_t * seq_ntok = nullptr; // [n_seqs]
+    const uint32_t * seq_tok0 = nullptr; // [n_seqs]
+
+    bool ragged() const {
+        return seq_ntok != nullptr;
+    }
+    uint32_t ntok(uint32_t s) const {
+        return seq_ntok ? seq_ntok[s] : n_seq_tokens;
+    }
+    uint32_t tok0(uint32_t s) const {
+        return seq_tok0 ? seq_tok0[s] : s*n_seq_tokens;
+    }
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -122,6 +141,10 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
     std::vector<float> state;
+
+    // strixllama: the state rows read where they are (llama_batch_ext_set_state_rows): n_embd_state floats an entry, in
+    // entry order, valid until the batch is processed; null: the rows are in `state`
+    const float * state_rows = nullptr;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -189,6 +212,15 @@ public:
     // TODO: extend to support multiple _full_ sequences in the ubatch
     llama_ubatch split_seq(uint32_t n_ubatch);
 
+    // strixllama: one ubatch for sequence sets of different lengths (llama_ubatch::ragged): the shortest sets whole,
+    // the rest of n_ubatch to the longer ones in turn, and no set leaves fewer than n_keep_tail tokens for a later
+    // ubatch. Needs a batch without coupled sequences (has_coupled)
+    llama_ubatch split_ragged(uint32_t n_ubatch, uint32_t n_keep_tail);
+
+    bool has_coupled() const {
+        return has_cpl;
+    }
+
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
@@ -198,7 +230,9 @@ private:
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
-    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
+    // strixllama: seq_ntok, when given, makes a ragged ubatch: the token count of each of the n_seqs sets, in order
+    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs,
+                            const std::vector<uint32_t> * seq_ntok = nullptr);
 
     // for debugging, start with LLAMA_BATCH_DEBUG=2
     void ubatch_print(const llama_ubatch & ubatch, int debug);
@@ -212,6 +246,12 @@ private:
     //       ref: https://github.com/ggml-org/llama.cpp/issues/13694#issuecomment-2983871762
     const uint32_t n_pos_per_embd;
 
+public:
+    // strixllama: positions may jump forward, as with M-RoPE - an MTP draft context, which never sees a prompt's
+    // image tokens (the drafter skips embedding batches), on a model with plain RoPE (Nemotron 3.5 Super)
+    bool allow_pos_jumps = false;
+
+private:
     const bool allow_mixed;
 
     uint32_t n_embd;
@@ -223,6 +263,7 @@ private:
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+    const float *               state_ptr = nullptr;   // strixllama: state_vec, or the batch's rows read in place
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

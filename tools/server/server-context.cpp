@@ -20,18 +20,22 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#define XXH_INLINE_ALL
+#include "vendor/hash/xxhash/xxhash.h"
 #include "base64.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <climits>
 #include <cstddef>
 #include <cinttypes>
-#include <deque>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <random>
 #include <utility>
 #include <fstream>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -43,6 +47,87 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// strixllama: CPU-side breakdown of one speculative pass (STRIX_SPEC_TIMING=1). A pass starts at the
+// draft call; the line printed there covers the previous pass: the draft (its llama_decode calls
+// included), the target decode, the catch-up decode inside common_speculative_process, the target
+// sampling in sample_and_accept_n, and whatever is left, which is server bookkeeping.
+struct strixllama_spec_timing {
+    static bool enabled() { static const bool e = getenv("STRIX_SPEC_TIMING") && atoi(getenv("STRIX_SPEC_TIMING")); return e; }
+    int64_t t_pass0 = 0, draft = 0, decode = 0, process = 0, sample = 0;
+    // strixllama: where "other" goes - pre: update_slots entry to the draft call (slot bookkeeping,
+    // checkpoints, batch assembly); post: post_decode less the sampling it already counts (accept,
+    // process_token, responses); gap: between update_slots calls (the task queue, HTTP work)
+    int64_t pre = 0, post = 0, gap = 0, t_enter = 0, t_exit = 0;
+    int n_batch_tokens = 0;
+    void begin_pass() {
+        const int64_t now = ggml_time_us();
+        if (t_pass0) {
+            const int64_t pass = now - t_pass0;
+            fprintf(stderr, "ST pass=%.1fms n=%d draft=%.1f decode=%.1f process=%.1f sample=%.1f other=%.1f pre=%.1f post=%.1f gap=%.1f\n",
+                    pass / 1000.0, n_batch_tokens, draft / 1000.0, decode / 1000.0, process / 1000.0, sample / 1000.0,
+                    (pass - draft - decode - process - sample) / 1000.0, pre / 1000.0, (post - sample) / 1000.0, gap / 1000.0);
+        }
+        t_pass0 = now; draft = decode = process = sample = 0; pre = post = gap = 0; n_batch_tokens = 0;
+    }
+};
+static strixllama_spec_timing g_spec_timing;
+
+// strixllama: a failing operator new reports the size it asked for and its call stack as module+offset before the
+// std::bad_alloc surfaces as "bad allocation". That message alone could not tell an out-of-memory machine from a
+// size computed out of garbage; on this machine it was the first (the commit limit, see docs/measuring.md).
+#if defined(_WIN32)
+#include <new.h>
+static int strixllama_new_handler(size_t size) {
+    // the stacks of the first few failures, then one line every 10 s with the count (issue #22: a retry that failed at
+    // every step printed a 48-frame stack each time)
+    static std::atomic<uint32_t> n_failed{0};
+    static std::atomic<uint64_t> t_last{0};
+    const uint32_t k   = ++n_failed;
+    const uint64_t now = GetTickCount64();
+    if (k > 4) {
+        uint64_t last = t_last.load();
+        if (now - last >= 10000 && t_last.compare_exchange_strong(last, now)) {
+            fprintf(stderr, "NEW_FAILED size=%zu (0x%zx), %u failed allocations so far\n", size, size, (unsigned) k);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    t_last = now;
+    void * frames[48];
+    const USHORT n = CaptureStackBackTrace(1, 48, frames, nullptr);
+    fprintf(stderr, "NEW_FAILED size=%zu (0x%zx)\n", size, size);
+    for (USHORT i = 0; i < n; ++i) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (LPCSTR) frames[i], &mod) && mod) {
+            GetModuleFileNameA(mod, name, MAX_PATH);
+        }
+        const char * base = strrchr(name, '\\');
+        fprintf(stderr, "NEW_FAILED   #%u %s+0x%llx\n", (unsigned) i, base ? base + 1 : name,
+                (unsigned long long) ((const char *) frames[i] - (const char *) mod));
+    }
+    fflush(stderr);
+    return 0;
+}
+static const int strixllama_new_handler_installed = [] { _set_new_handler(strixllama_new_handler); return 1; }();
+#endif
+
+// strixllama: fault injection for the paths an exhausted commit limit takes (STRIX_FAULT=<site>:<n>: the n-th pass
+// through <site> - ckpt, decode or post - throws std::bad_alloc). For tests of the error handling only.
+static void strixllama_fault(const char * site) {
+    static const std::string spec = [] { const char * e = getenv("STRIX_FAULT"); return std::string(e ? e : ""); }();
+    const size_t colon = spec.find(':');
+    if (colon == std::string::npos || spec.compare(0, colon, site) != 0) {
+        return;
+    }
+    static int n = 0;
+    if (++n == atoi(spec.c_str() + colon + 1)) {
+        fprintf(stderr, "STRIX_FAULT: %s #%d throws std::bad_alloc\n", site, n);
+        throw std::bad_alloc();
+    }
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -172,6 +257,10 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // strixllama: set while the batch's sub-batches are decoded: a slot that fails then keeps its tokens (drop_slot
+    // would move the entries under the loop)
+    bool decoding = false;
+
     void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
@@ -209,10 +298,30 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        decoding          = false;
     }
 
     int32_t size() const {
         return (int32_t)tokens.size();
+    }
+
+    // strixllama: the tokens of one slot out of a batch that is still being built (the slot failed part way)
+    void drop_slot(int32_t id_slot) {
+        std::vector<token> keep;
+        std::vector<float> keep_embd;
+        for (const auto & t : tokens) {
+            if (t.id_slot == id_slot) {
+                continue;
+            }
+            token k = t;
+            if (t.i_embd >= 0) {
+                k.i_embd = (int32_t) (keep_embd.size() / n_embd);
+                keep_embd.insert(keep_embd.end(), embd.begin() + (size_t) t.i_embd*n_embd, embd.begin() + (size_t) (t.i_embd + 1)*n_embd);
+            }
+            keep.push_back(k);
+        }
+        tokens.swap(keep);
+        embd.swap(keep_embd);
     }
 
     // remove the entries after the first n
@@ -254,6 +363,40 @@ struct server_batch {
         }
     }
 };
+
+// strixllama: what the disk tier knows about a conversation's last answer across its trips to the store: whether its
+// client drops answers (server_slot::tail_forks), and the answer's first tokens as generated (a hash of up to
+// tail_hash_max), to compare the next request with. A conversation that leaves its slot files them under its tokens up
+// to where that answer started (n_prompt_end); one loaded back finds them under its answer-start checkpoint's position.
+// Memory only: a restarted server does not know, and writes the answer until the next request shows what it does
+struct tail_known {
+    bool     forks = false;
+    int32_t  n     = 0;         // the answer tokens hashed
+    uint64_t hash  = 0;
+};
+
+static constexpr int32_t tail_hash_max = 64;
+
+static std::unordered_map<uint64_t, tail_known> & tail_forks_known() {
+    static std::unordered_map<uint64_t, tail_known> known;
+    return known;
+}
+
+static uint64_t tail_hash(const llama_tokens & text, int64_t p0, int32_t n) {
+    return XXH3_64bits(text.data() + p0, (size_t) n*sizeof(llama_token));
+}
+
+static uint64_t tail_forks_key(const llama_tokens & text, int64_t n) {
+    return XXH3_64bits(text.data(), (size_t) n*sizeof(llama_token)) ^ (uint64_t) n;
+}
+
+// strixllama: the draft length the manager's "Draft length" setting asks for, below the --spec-draft-n-max the server
+// started with (the manager starts it with at least 3): STRIX_SPEC_DRAFT_CAP at start, POST /strix/spec while it runs.
+// A change took a reload before, and a reload empties the slots and the RAM cache (10-09). 0: no drafting
+static std::atomic<int> g_strix_draft_cap{ [] {
+    const char * e = getenv("STRIX_SPEC_DRAFT_CAP");
+    return e && *e ? std::max(0, atoi(e)) : INT_MAX;
+}() };
 
 struct server_slot {
     int id;
@@ -301,6 +444,35 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // strixllama: speculative sampling (STRIX_SPEC_SAMPLING, see common_sampler_sample_and_accept_n_spec): when this
+    // task's sampler allows it, the drafter draws the draft from q with spec_draft_rng and records q in spec_draft_q,
+    // and the verification accepts by p / q with spec_verify_rng
+    bool spec_sampling = false;
+    common_speculative_sample_params spec_sample;   // its q is spec_draft_q (above)
+    std::mt19937 spec_draft_rng;
+    std::mt19937 spec_verify_rng;
+
+    // strixllama: where the prompt chunk starts whose per-layer-embedding rows the last step announced (-1: none)
+    int64_t ple_announced = -1;
+
+    // strixllama: the length of the last prompt the slot processed, less a last token the next request re-renders (a
+    // thinking prompt's, see think_tail); 0: none since it was cleared or loaded. The answer after it is the
+    // conversation's main line only once the next request continues it (n_mainline)
+    int64_t n_prompt_end = 0;
+    // the conversation's last request went past its prompt's end and kept less than the answer: its client re-renders
+    // answers (drops the reasoning, re-serializes a tool call, sends a cut one back), so the answer in the slot is
+    // expected to be dropped as well
+    bool tail_forks = false;
+    // a conversation loaded back from the store without its last answer: that answer's first tokens as generated
+    // (tail_known), which the next request is compared with
+    int32_t  tail_n    = 0;
+    uint64_t tail_hash_v = 0;
+
+    // strixllama: the pool guard (pool_guard_on) holds this slot's prompt back until there are cells for it, or its
+    // answer for a step
+    bool pool_waiting = false;
+    bool pool_paused  = false;
+
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -339,7 +511,235 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // strixllama: prompt length when persist_idle_slots() last decided about this slot, so it looks again
+    // only once the conversation has changed
+    int32_t n_tokens_persist_checked = -1;
+
+    // strixllama: this slot's checkpoints whose bytes went back to the disk tier (see persist_idle_slots), and
+    // the cache they are pinned in, so clearing the slot can let go of them
+    server_prompt_cache::ckpt_paged_map ckpt_paged;
+    server_prompt_cache * disk_cache = nullptr;
+
+    // strixllama: disk tier version 3 - this conversation's runs of attention rows in the store (or on their way),
+    // in position order from 0; they are written once and the next one starts where they end. Cleared whenever the
+    // slot takes another conversation, cut when this one is rewound.
+    mutable server_prompt_cache::disk_runs_state runs;
+
+    // strixllama: when a run of this conversation last failed to gather (no memory, or the cache refused its rows);
+    // the next try waits GATHER_RETRY_US (see persist_runs)
+    mutable int64_t t_gather_failed_us = 0;
+    static constexpr int64_t GATHER_RETRY_US = 30 * 1000000LL;
+
+    void runs_truncate(llama_pos p) const {
+        for (auto * v : { &runs.tgt, &runs.dft }) {
+            while (!v->empty() && v->back().pos0 >= p) {
+                v->pop_back();
+            }
+            if (!v->empty()) {
+                v->back().n_use = std::min<int32_t>(v->back().n_use, p - v->back().pos0);
+            }
+        }
+        if (runs.tokens.size() > (size_t) p) {
+            runs.tokens.resize(p);
+        }
+    }
+
+    // strixllama: hand the disk tier this conversation's rows it has not got, a run of disk_run positions at a time -
+    // gathered out of the cache (~15 ms for 120 MB) and written once by the writer. With `leaving`, the rest goes
+    // too, a run that ends short, and the recurrent state at the end: the conversation is about to leave the slot,
+    // so the store brings all of it back. Nothing to do is success; false when it could not be handed over.
+    bool persist_runs(server_prompt_cache & cache, bool leaving, bool wait) const {
+        const uint64_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
+        const uint64_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
+        if (!cache.has_disk() || cache.disk_run <= 0 || row_tgt == 0 || (ctx_dft && row_dft == 0) || prompt.n_tokens() == 0) {
+            return false;
+        }
+        // the text tokens, not get_tokens(): with a vision projector loaded every prompt is a media prompt to
+        // get_tokens(), which aborts, although this one has no media in it
+        const llama_tokens text = prompt.tokens.get_text_tokens();
+        if (text.size() != (size_t) prompt.n_tokens()) {
+            return false;                           // media: the disk tier does not store it
+        }
+        if (cache.runs_lost(id)) {
+            runs = {};                              // the store lost a run of ours: start over
+        }
+        // the runs hold only as far as the prompt still starts with the tokens they were written for: a rewind that
+        // took another turn, a context shift, a reused cache chunk - wherever it differs, they are cut there
+        {
+            const llama_tokens & cur = text;
+            const size_t lim = std::min(cur.size(), runs.tokens.size());
+            const size_t same = (size_t) (std::mismatch(cur.begin(), cur.begin() + lim, runs.tokens.begin()).first - cur.begin());
+            if (same < runs.tokens.size()) {
+                runs_truncate((llama_pos) same);
+            }
+        }
+        auto cover = [](const std::vector<server_prompt_cache::disk_run_ref> & v) {
+            int64_t n = 0;
+            for (const auto & r : v) {
+                n += r.n_use;
+            }
+            return n;
+        };
+        // the positions both the prompt and the cache hold: a token just sampled is not in the cache yet
+        const int64_t n_tok    = prompt.n_tokens();
+        const int64_t live_tgt = std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1);
+        // strixllama: only the conversation's main line (n_mainline): an answer the next request has not continued yet
+        // waits - a client that drops the reasoning forks every one - and goes as the conversation leaves unless its
+        // client is expected to drop it (tail_forks). STRIX_DISK_MAINLINE=0 writes all of it, as up to 0.3.1
+        static const bool mainline = !getenv("STRIX_DISK_MAINLINE") || atoi(getenv("STRIX_DISK_MAINLINE")) != 0;
+        const int64_t n_main  = !mainline || (leaving && !tail_forks) ? n_tok : n_mainline();
+        if (mainline && leaving && n_prompt_end > 0 && n_prompt_end <= (int64_t) text.size()) {
+            auto & known = tail_forks_known();
+            if (known.size() >= 4096) {
+                known.clear();                      // a bound, not a cache policy: what is lost is relearnt in a turn
+            }
+            tail_known k;
+            k.forks = tail_forks;
+            k.n     = (int32_t) std::min<int64_t>(tail_hash_max, (int64_t) text.size() - n_prompt_end);
+            k.hash  = k.n > 0 ? tail_hash(text, n_prompt_end, k.n) : 0;
+            known[tail_forks_key(text, n_prompt_end)] = k;
+        }
+        const int64_t end_tgt = std::min<int64_t>(live_tgt, n_main);
+        const int64_t end_dft = ctx_dft ? std::min<int64_t>(std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id) + 1), n_main) : 0;
+
+        auto new_tgt = runs.tgt;
+        auto new_dft = runs.dft;
+        std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> data;
+        // strixllama (issue #22): a run gathered while the writer was busy was dropped again, and gathered again at the
+        // next step, ~120 MB off the device each time; after a failed gather every step tried again and logged it, and
+        // with the commit limit reached that wrote the log full. A save that neither waits nor leaves now holds its
+        // runs back while the writer is busy, and for GATHER_RETRY_US after a failure
+        bool held = false;
+        auto gather = [&](llama_context * ctx, uint64_t row, std::vector<server_prompt_cache::disk_run_ref> & v, int64_t end) {
+            for (int64_t p = cover(v); p < end; ) {
+                const int64_t len = std::min<int64_t>(cache.disk_run, end - p);
+                if (len < cache.disk_run && !leaving) {
+                    break;                          // a run that is not full waits, unless the conversation leaves
+                }
+                if (!wait && !leaving && (cache.disk_busy() ||
+                        (t_gather_failed_us != 0 && ggml_time_us() - t_gather_failed_us < GATHER_RETRY_US))) {
+                    held = true;
+                    return false;
+                }
+                std::vector<uint8_t> rows((size_t) (len * (int64_t) row));
+                if (!llama_strix_kv_get_rows(ctx, id, (llama_pos) p, (int32_t) len, rows.data(), rows.size())) {
+                    return false;
+                }
+                const auto r = server_prompt_cache::make_run_ref(rows, (int32_t) p, (int32_t) len);
+                v.push_back(r);
+                data.push_back({ { r.hi, r.lo }, std::move(rows) });
+                p += len;
+            }
+            return true;
+        };
+        try {
+            if (!gather(ctx_tgt, row_tgt, new_tgt, end_tgt) || (ctx_dft && !gather(ctx_dft, row_dft, new_dft, end_dft))) {
+                if (!held) {
+                    t_gather_failed_us = ggml_time_us();
+                    SLT_WRN(*this, "%s", "disk cache: the cache would not give up its rows; not writing them (again in 30 s)\n");
+                }
+                return false;
+            }
+        } catch (const std::bad_alloc &) {
+            t_gather_failed_us = ggml_time_us();
+            SLT_WRN(*this, "%s", "disk cache: not enough memory to gather a run; trying again in 30 s\n");
+            return false;
+        }
+        t_gather_failed_us = 0;
+        const int64_t n_entry = cover(new_tgt);
+        if (n_entry == 0 || (data.empty() && !leaving)) {
+            return true;
+        }
+
+        // leaving, with the runs up to the last position the cache holds: the recurrent state now is the state at the
+        // entry's end (a token sampled last and not decoded is not in the entry; the next prompt brings it again)
+        common_prompt_checkpoint end_ckpt;
+        const common_prompt_checkpoint * end = nullptr;
+        // the state now is the state at the entry's end only when the entry reaches the cache's end
+        if (leaving && n_entry == live_tgt) {
+            end_ckpt.update_pos(n_entry, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id),
+                                         llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id));
+            try {
+                end_ckpt.update_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (getenv("STRIX_STATE_HASH")) {
+                    SLT_INF(*this, "STATE_HASH end state as it leaves: %zu bytes, %016llx (%lld tokens)\n", end_ckpt.data_tgt.size(),
+                            (unsigned long long) XXH3_64bits(end_ckpt.data_tgt.data(), end_ckpt.data_tgt.size()), (long long) n_entry);
+                    // DEV: STRIX_STATE_DUMP=<dir> also writes the whole state (KV included) as the conversation leaves
+                    if (getenv("STRIX_STATE_DUMP")) {
+                        std::vector<uint8_t> st(llama_state_seq_get_size_ext(ctx_tgt, id, 0));
+                        llama_state_seq_get_data_ext(ctx_tgt, st.data(), st.size(), id, 0);
+                        const std::string fn = std::string(getenv("STRIX_STATE_DUMP")) + "/leave_" + std::to_string(n_entry) + ".bin";
+                        if (FILE * f = fopen(fn.c_str(), "wb")) {
+                            fwrite(st.data(), 1, st.size(), f);
+                            fclose(f);
+                        }
+                        SLT_INF(*this, "STATE_HASH whole as it leaves: %zu bytes, %016llx\n", st.size(),
+                                (unsigned long long) XXH3_64bits(st.data(), st.size()));
+                    }
+                }
+                end_ckpt.update_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                common_speculative_get_state(spec, id, end_ckpt.data_spec);
+                end = &end_ckpt;
+            } catch (const std::bad_alloc &) {
+                SLT_WRN(*this, "%s", "disk cache: not enough memory for the recurrent state; the entry ends at an earlier checkpoint\n");
+            }
+        }
+
+        // the recurrent state is the part of a conversation that changes, so the store gets it only as the conversation
+        // leaves: the state at the end; the last two checkpoints of its last prompt - just before its end, where a
+        // regenerated answer or a template that drops the thinking goes back to, and for a short turn its last user
+        // message; and before them one every disk_ckpt_step tokens, so a deeper rewind once the conversation is back
+        // (an edited earlier message, an agent trimming old tool output) replays at most that much. Checkpoints the
+        // store has already are named and count towards the spacing; nothing is written twice.
+        std::set<const common_prompt_checkpoint *> writable;
+        if (leaving) {
+            int id_last = -1;
+            for (const auto & c : prompt.checkpoints) {
+                if (!c.data_tgt.empty() && c.n_tokens <= n_entry) {
+                    id_last = std::max(id_last, c.id_task);
+                }
+            }
+            for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend() && writable.size() < 2; ++it) {
+                if (!it->data_tgt.empty() && it->n_tokens <= n_entry && it->id_task == id_last) {
+                    writable.insert(&*it);
+                }
+            }
+            int64_t prev = -cache.disk_ckpt_step;          // the last checkpoint the entry keeps, in position order
+            for (const auto & c : prompt.checkpoints) {
+                if (c.n_tokens > n_entry || writable.count(&c)) {
+                    continue;
+                }
+                if (c.n_tokens >= prev + cache.disk_ckpt_step) {
+                    if (!c.data_tgt.empty()) {
+                        writable.insert(&c);
+                    }
+                    prev = c.n_tokens;
+                }
+            }
+        }
+
+        server_tokens tokens = prompt.tokens.clone();
+        tokens.keep_first((size_t) n_entry);
+        const size_t n_new = data.size();
+        if (!cache.persist_runs(id, tokens, prompt.checkpoints, writable, &ckpt_paged, end, row_tgt, row_dft, new_tgt, new_dft,
+                                std::move(data), wait)) {
+            return false;
+        }
+        runs.tgt = std::move(new_tgt);
+        runs.dft = std::move(new_dft);
+        runs.tokens.assign(text.begin(), text.begin() + std::min<size_t>(text.size(), (size_t) cover(runs.tgt)));
+        if (leaving || n_new > 0) {
+            SLT_INF(*this, "disk cache: %zu new runs handed over, %lld of %lld tokens in runs (draft %lld)%s\n", n_new,
+                    (long long) n_entry, (long long) n_tok, (long long) cover(runs.dft), end ? ", with the state at the end" : "");
+        }
+        return true;
+    }
+
+    // strixllama: `ram` also keeps the state in the RAM tier (upstream's behaviour); `wait` blocks while the
+    // disk writer's queue is full instead of letting the disk copy go. The disk tier gets its own copy through
+    // a background writer, and only when it has not got this conversation, or a longer one, already - so the
+    // main loop pays for gathering the state out of the KV cache (~0.1 s for 2.3 GiB) and nothing more.
+    bool prompt_save(server_prompt_cache & prompt_cache, bool ram = true, bool wait = true) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -352,23 +752,125 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
+        bool to_disk = prompt_cache.has_disk() && prompt_cache.disk_wants(prompt);
+
+        // a save that would not wait for the writer skips the gather too when the writer has a job waiting
+        if (to_disk && !ram && !wait && prompt_cache.disk_busy()) {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // strixllama: disk tier version 3 - the store gets the rows it has not got and the recurrent state at the end,
+        // never the whole state; the RAM tier below still takes a short conversation whole
+        bool queued_runs = false;
+        if (to_disk && llama_strix_kv_row_size(ctx_tgt) > 0 && (!ctx_dft || llama_strix_kv_row_size(ctx_dft) > 0)) {
+            queued_runs = persist_runs(prompt_cache, /* leaving = */ true, wait);
+            to_disk = false;
+            if (!ram) {
+                return queued_runs;
+            }
         }
 
-        return true;
+        // a checkpoint handed back to the disk tier has no bytes here, and the RAM tier would keep it that way
+        const bool paged = std::any_of(prompt.checkpoints.begin(), prompt.checkpoints.end(),
+                                       [](const common_prompt_checkpoint & c) { return c.data_tgt.empty(); });
+
+        auto * cur = ram && !paged ? prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft) : nullptr;
+        if (cur == nullptr && !to_disk) {
+            return queued_runs;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        std::vector<uint8_t> tmp_tgt;
+        std::vector<uint8_t> tmp_dft;
+        if (cur == nullptr) {
+            try {
+                tmp_tgt.resize(cur_size_tgt);
+                tmp_dft.resize(cur_size_dft);
+            } catch (const std::bad_alloc &) {
+                SRV_WRN(" - disk cache: not enough memory to gather %.3f MiB of state\n", cur_size / (1024.0 * 1024.0));
+                return false;
+            }
+        }
+        uint8_t * dst_tgt = cur ? cur->data.main.data() : tmp_tgt.data();
+        uint8_t * dst_dft = cur ? cur->data.drft.data() : tmp_dft.data();
+        const int64_t t1 = ggml_time_us();
+        llama_state_seq_get_data_ext(ctx_tgt, dst_tgt, cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, dst_dft, cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        if (cur) {
+            common_speculative_get_state(spec, id, cur->data.spec);
+        }
+        const int64_t t2 = ggml_time_us();
+
+        bool queued = false;
+        if (to_disk) {
+            if (cur) {
+                // the RAM tier keeps its buffers; the writer gets copies
+                queued = prompt_cache.persist(prompt, std::vector<uint8_t>(cur->data.main), std::vector<uint8_t>(cur->data.drft), wait, &ckpt_paged);
+            } else {
+                queued = prompt_cache.persist(prompt, std::move(tmp_tgt), std::move(tmp_dft), wait, &ckpt_paged);
+            }
+        }
+        const int64_t t3 = ggml_time_us();
+
+        SLT_INF(*this, "saved %d tokens (%.3f GiB): buffers %.0f ms, gather %.0f ms, hand-off %.0f ms%s%s\n",
+                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0 * 1024.0),
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
+                cur ? ", kept in RAM" : "", to_disk ? (queued ? ", queued for disk" : ", disk writer busy") : "");
+
+        return cur != nullptr || queued || queued_runs;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens,
+                     const std::function<void(size_t)> & make_room_for = nullptr) {
+        // strixllama: when an entry is about to replace this slot's conversation, the old one's pins go, its block
+        // bookkeeping goes, and room is made in the pool for the whole entry
+        bool replaced = false;
+        auto before_restore = [&](size_t n_tokens) {
+            replaced = true;
+            prompt_cache.ckpt_release(ckpt_paged);
+            n_tokens_persist_checked = -1;
+            runs = {};
+            if (make_room_for) {
+                make_room_for(n_tokens);
+            }
+        };
+        // an entry restored from the disk tier leaves its checkpoints there, pinned for this slot like paged-out ones,
+        // and one of version 3 its runs, which the slot writes on from
+        std::vector<uint8_t> spec_state;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, before_restore, &ckpt_paged, &runs, &spec_state);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        }
+        // the drafter carries the target's row of the last position into the next batch: the restored conversation's,
+        // or none (an entry stored without it), never the one this slot held before
+        if (replaced) {
+            common_speculative_set_state(spec, id, spec_state);
+        }
+        // strixllama: where the restored conversation's last answer started, and what its client does with answers, if a
+        // slot filed it as the conversation left (tail_forks_known): its answer-start checkpoint came back with it
+        if (replaced) {
+            n_prompt_end = 0;
+            tail_forks   = false;
+            tail_n       = 0;
+            tail_hash_v  = 0;
+            const auto & known = tail_forks_known();
+            if (res && !known.empty() && prompt.tokens.get_text_tokens().size() == prompt.tokens.size()) {
+                const llama_tokens & text = prompt.tokens.get_text_tokens();
+                for (const auto & c : prompt.checkpoints) {
+                    if (c.n_tokens <= n_prompt_end || c.n_tokens > (int64_t) text.size()) {
+                        continue;
+                    }
+                    const auto it = known.find(tail_forks_key(text, c.n_tokens));
+                    if (it != known.end()) {
+                        n_prompt_end = c.n_tokens;
+                        tail_forks   = it->second.forks;
+                        tail_n       = it->second.n;
+                        tail_hash_v  = it->second.hash;
+                    }
+                }
+            }
         }
 
         return res;
@@ -380,6 +882,27 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        n_tokens_persist_checked = -1;
+        if (disk_cache) {
+            disk_cache->ckpt_release(ckpt_paged);
+        }
+        ckpt_paged.clear();
+        runs = {};
+        n_prompt_end = 0;
+        tail_forks   = false;
+        tail_n       = 0;
+        tail_hash_v  = 0;
+    }
+
+    // strixllama: the leading tokens known to be the conversation's main line - a prompt is, as it is processed; the
+    // answer after it only once the next request continues it. The disk tier is given only these (persist_runs)
+    int64_t n_mainline() const {
+        const int64_t n = prompt.n_tokens();
+        if (state == SLOT_STATE_STARTED || state == SLOT_STATE_PROCESSING_PROMPT || n_prompt_end <= 0) {
+            return n;
+        }
+        return std::min<int64_t>(n, n_prompt_end);
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -400,13 +923,29 @@ struct server_slot {
     // realtime transcription, see SERVER_TASK_TYPE_TRANSCRIBE_RT
     mtmd::audio_stream_ptr audio_stream;
     bool audio_wait = false; // the stream needs more audio before it can produce rows
-    std::deque<int64_t> audio_commit_rows; // end row of each non-final commit not yet completed
 
     server_slot_stats stats;
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
+
+    // strixllama (issue #18): a sampled draft on one generating conversation is the table's length (2) or one more,
+    // whichever gives more tokens a second here. Each pass of either length shows whether its first two positions
+    // were accepted (acc1, acc2, running means); a pass of the longer one also shows the third given the first two
+    // (acc3) and costs its own time (ms[1] against ms[0]). Tokens a pass: 1 + acc1 + acc2, plus acc2 * acc3 for the
+    // longer one. Kept across the slot's requests: a conversation's next request is the same kind of text
+    // The length holds for a block of passes: each switch rebuilds the verify graph (another shape), and passes
+    // alternating between lengths measured the longer one ~30 ms dearer than it is. The first passes of a block are
+    // not timed.
+    struct spec_len_stats {
+        double acc1 = 0, acc2 = 0, acc3 = 0, ms[2] = { 0, 0 };
+        int    n_acc = 0, n_acc3 = 0, n_ms[2] = { 0, 0 };
+        int    block = 0, block_arm = 0, block_left = 0, block_untimed = 0;
+    } spec_len;
+    int     spec_len_arm = -1; // this pass: 0 the table's length, 1 one more, -1 not chosen here
+    int64_t spec_len_t   = 0;  // when this slot's previous pass ended (0: none to time from)
+    int     spec_len_used[2] = { 0, 0 };
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -419,6 +958,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        ple_announced  = -1;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -430,6 +970,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -443,8 +984,21 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_len_arm = -1;
+        spec_len_t   = 0;
+        spec_len_used[0] = spec_len_used[1] = 0;
+        // the previous request's statistics stay as a start, at the weight of a few passes: a chat that turns from code
+        // to prose kept code's acceptance of the third position for hundreds of passes
+        spec_len.n_acc     = std::min(spec_len.n_acc, 16);
+        spec_len.n_acc3    = std::min(spec_len.n_acc3, 16);
+        spec_len.n_ms[0]   = std::min(spec_len.n_ms[0], 8);
+        spec_len.n_ms[1]   = std::min(spec_len.n_ms[1], 8);
+        spec_len.block_left = 0;
 
         n_predict_max = -1;
+
+        pool_waiting = false;
+        pool_paused  = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -458,7 +1012,6 @@ struct server_slot {
 
         audio_stream.reset();
         audio_wait = false;
-        audio_commit_rows.clear();
         inp_embd.clear();
     }
 
@@ -723,6 +1276,17 @@ struct server_slot {
     }
 
     void print_timings_pp() const {
+        // STRIX_STATE_HASH: the slot's state after every prompt batch, to find the first batch where two runs part
+        // (debugging only)
+        if (getenv("STRIX_STATE_HASH") && prompt.n_tokens() > 0) {
+            for (const llama_state_seq_flags fl : { (llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, (llama_state_seq_flags) 0 }) {
+                std::vector<uint8_t> st(llama_state_seq_get_size_ext(ctx_tgt, id, fl));
+                llama_state_seq_get_data_ext(ctx_tgt, st.data(), st.size(), id, fl);
+                SLT_INF(*this, "STATE_HASH batch %s: %016llx at %d tokens\n", fl ? "recurrent" : "whole",
+                        (unsigned long long) XXH3_64bits(st.data(), st.size()), prompt.n_tokens());
+            }
+        }
+
         const double t_prompt_total = stats.t_prompt_ms();
 
         if (t_prompt_total < 3000.0) {
@@ -789,6 +1353,10 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            if (spec_len_used[0] + spec_len_used[1] > 0) {
+                SLT_INF(*this, "draft length: %d passes at the table's, %d at one more (acc %.2f %.2f %.2f, %.1f / %.1f ms a pass)\n",
+                        spec_len_used[0], spec_len_used[1], spec_len.acc1, spec_len.acc2, spec_len.acc3, spec_len.ms[0], spec_len.ms[1]);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -849,6 +1417,12 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        other.runs   = runs;                         // strixllama: the same rows, so the same runs
+        {
+            std::vector<uint8_t> spec_state;         // and the drafter's carried row of them
+            common_speculative_get_state(spec, id, spec_state);
+            common_speculative_set_state(spec, other.id, spec_state);
+        }
         other.init_sampler();
     }
 };
@@ -1012,17 +1586,16 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
-    mtmd_helper_cap mtmd_cap = {};
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
     bool has_cap_tts() const {
-        return mtmd_cap.audio_gen;
+        return mctx != nullptr && mtmd_gen_audio_get_info(mctx).type != MTMD_GEN_AUDIO_TYPE_NONE;
     }
 
     bool has_cap_chat() const {
-        return mtmd_cap.chat;
+        return mctx == nullptr || mtmd_helper_model_can_chat(ctx_tgt, mctx);
     }
 
     server_decision_context decision;
@@ -1078,6 +1651,156 @@ private:
 
     common_speculative_ptr spec;
 
+    // strixllama: the draft length when several conversations generate (STRIX_SPEC_ADAPT=0: the STRIX_SPEC_DRAFT_BY_SLOTS
+    // table). A draft position pays when the tokens its acceptance adds outweigh what the longer verify costs, and both
+    // vary with the text: on prose four conversations made the most tokens with one draft each and lost 16% with two,
+    // on repetitive text eight made 58% more with two than without (homogeneous prompts), and on eight distinct real
+    // tasks two conversations did best with three, four with two, eight with one (10-12). The verify's cost depends on
+    // how many experts the conversations' tokens share, and the drafter cuts a draft short where it is unsure. So each
+    // cap is judged by what it did on this server: per number of generating conversations and cap, running means of a
+    // step's time and of the tokens the step produced. A cap not yet seen there is tried first, one not seen for 256
+    // steps again, in probing blocks of a few steps; otherwise the best holds for a block of 16 steps, and moves only for
+    // one 3% ahead. One conversation keeps the table (and issue #18's choice)
+    struct spec_adapt_t {
+        static constexpr int NG = 9;   // generating conversations 2 .. 8 (more count as 8)
+        static constexpr int ND = 4;   // caps 0 .. 3
+        double  ms[NG][ND]  = {};      // a step's time, running mean
+        double  tok[NG][ND] = {};      // the tokens it produced, running mean
+        int     n[NG][ND]   = {};
+        int64_t at[NG][ND]  = {};      // the step it was last measured in
+        int64_t step    = 0;
+        int     d       = -1;          // the cap in force
+        int     d_ng    = 0;           // for this many generating conversations
+        int     left    = 0;           // steps it still holds
+        bool    probing = false;
+        int     untimed = 0;           // steps not measured after a change of shape (the new shape's graph is built)
+        // the step being measured
+        int64_t t0 = 0;
+        int64_t t_gen0 = 0;            // tokens generated before it, all slots
+        int     t_ng = 0, t_d = -1, t_gen_rows = 0;
+        bool    t_pure = false;
+    } spec_adapt;
+
+    static bool spec_adapt_on() {
+        static const bool on = !getenv("STRIX_SPEC_ADAPT") || atoi(getenv("STRIX_SPEC_ADAPT")) != 0;
+        return on;
+    }
+
+    static int spec_adapt_dbg() {
+        static const int v = getenv("STRIX_SPEC_ADAPT_DEBUG") ? atoi(getenv("STRIX_SPEC_ADAPT_DEBUG")) : 0;
+        return v;
+    }
+
+    int64_t spec_adapt_tokens_so_far() const {
+        int64_t n = 0;
+        for (const auto & sl : slots) {
+            n += sl.stats.n_gen;
+        }
+        return n;
+    }
+
+    // a step starts (pre_decode)
+    void spec_adapt_tick() {
+        auto & sa = spec_adapt;
+        sa.t0 = ggml_time_us();
+        sa.t_gen0 = spec_adapt_tokens_so_far();
+        sa.t_pure = false;
+        sa.t_ng = 0;
+        sa.t_d = -1;
+        sa.t_gen_rows = 0;
+        sa.step++;
+    }
+
+    // the step's last post_decode is done: measured if it carried only generation rows, under a chosen cap (not idle
+    // time between requests, not a prompt's prefill)
+    void spec_adapt_done() {
+        auto & sa = spec_adapt;
+        if (sa.t0 <= 0 || !sa.t_pure || sa.t_ng < 2 || sa.t_d < 0 || sa.t_d >= spec_adapt_t::ND) {
+            return;
+        }
+        if (sa.untimed > 0) {
+            sa.untimed--;
+            return;
+        }
+        const double  ms  = (ggml_time_us() - sa.t0) / 1e3;
+        const int64_t tok = spec_adapt_tokens_so_far() - sa.t_gen0;
+        if (tok <= 0 || tok > 64 * sa.t_ng) {
+            return;                    // a slot was reset in between
+        }
+        double & m = sa.ms[sa.t_ng][sa.t_d];
+        double & t = sa.tok[sa.t_ng][sa.t_d];
+        int    & n = sa.n[sa.t_ng][sa.t_d];
+        // a stall (another program, a disk read) is not this cap's time
+        if (ms < 2000.0 && (n < 4 || ms < 3.0 * m)) {
+            n = std::min(n + 1, 24);
+            m += (ms - m) / n;
+            t += ((double) tok - t) / n;
+            sa.at[sa.t_ng][sa.t_d] = sa.step;
+        }
+    }
+
+    // the draft cap for this step when ng (>= 2) conversations generate; table_d: the table's value (a start)
+    int spec_adapt_choose(int ng, int d_max, int table_d) {
+        auto & sa = spec_adapt;
+        ng = std::min(ng, spec_adapt_t::NG - 1);
+        d_max = std::min(d_max, spec_adapt_t::ND - 1);
+        if (sa.left > 0 && sa.d_ng == ng && sa.d >= 0 && sa.d <= d_max) {
+            sa.left--;
+            sa.t_ng = ng;
+            sa.t_d = sa.d;
+            return sa.d;
+        }
+        double tp[spec_adapt_t::ND];
+        for (int d = 0; d <= d_max; ++d) {
+            tp[d] = sa.n[ng][d] >= 2 ? sa.tok[ng][d] / sa.ms[ng][d] : -1.0;
+        }
+        const int d_prev = (sa.d_ng == ng && sa.d >= 0 && sa.d <= d_max) ? sa.d : std::min(std::max(table_d, 0), d_max);
+        // a cap to probe: one never measured here, else the stalest one past 256 steps
+        int probe = -1;
+        for (int d = 0; d <= d_max && probe < 0; ++d) {
+            if (sa.n[ng][d] < 2) {
+                probe = d;
+            }
+        }
+        if (probe < 0) {
+            int64_t oldest = 256;
+            for (int d = 0; d <= d_max; ++d) {
+                if (d != d_prev && sa.step - sa.at[ng][d] > oldest) {
+                    oldest = sa.step - sa.at[ng][d];
+                    probe = d;
+                }
+            }
+        }
+        int d_new = d_prev;
+        if (probe < 0) {
+            int d_best = d_prev;
+            for (int d = 0; d <= d_max; ++d) {
+                if (tp[d] > tp[d_best]) {
+                    d_best = d;
+                }
+            }
+            if (tp[d_prev] <= 0.0 || tp[d_best] > 1.03 * tp[d_prev]) {
+                d_new = d_best;        // clearly ahead: near the line the measurements' noise decides
+            }
+        }
+        const int d_go = probe >= 0 ? probe : d_new;
+        if (spec_adapt_dbg()) {
+            SRV_INF("spec adapt: %d generating, tok/ms %.4f %.4f %.4f %.4f -> cap %d%s (step %lld)\n", ng,
+                    tp[0], d_max >= 1 ? tp[1] : -1.0, d_max >= 2 ? tp[2] : -1.0, d_max >= 3 ? tp[3] : -1.0, d_go,
+                    probe >= 0 ? " (probe)" : "", (long long) sa.step);
+        }
+        if (d_go != sa.d || ng != sa.d_ng) {
+            sa.untimed = 1;
+        }
+        sa.probing = probe >= 0;
+        sa.d    = d_go;
+        sa.d_ng = ng;
+        sa.left = sa.probing ? 3 : 15;
+        sa.t_ng = ng;
+        sa.t_d  = d_go;
+        return d_go;
+    }
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1094,6 +1817,11 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    // strixllama: the pool guard (pool_guard_on) - the last get_available_slot() found no room for the prompt; steps in
+    // a row where every busy conversation waited for cells
+    bool pool_deferred = false;
+    int  n_pool_stalls = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1398,8 +2126,6 @@ private:
             }
         }
 
-        mtmd_cap = mtmd_helper_get_capabilities(model_tgt, mctx);
-
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -1586,6 +2312,54 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // strixllama: STRIX_PROMPT_CACHE_DIR / STRIX_PROMPT_CACHE_MIB add a disk tier under the RAM cache
+            // (tools/manager.py sets them from the "disk prompt cache" switch)
+            if (const char * dir = getenv("STRIX_PROMPT_CACHE_DIR"); dir && *dir) {
+                const char * mib = getenv("STRIX_PROMPT_CACHE_MIB");
+                // a state is only meaningful to the model that computed it, and two quants of one model - or two
+                // fine-tunes of one base at one quant - have identical state shapes, so the restore would take the
+                // other's without a word. The directory is named after the model: what it is, and which file.
+                uint64_t fp = 1469598103934665603ull;
+                auto mix = [&fp](const void * p, size_t n) {
+                    for (size_t i = 0; i < n; ++i) { fp ^= ((const uint8_t *) p)[i]; fp *= 1099511628211ull; }
+                };
+                char desc[256] = { 0 };
+                llama_model_desc(model_tgt, desc, sizeof(desc));
+                mix(desc, strlen(desc));
+                const uint64_t n_params = llama_model_n_params(model_tgt);
+                const uint64_t n_bytes  = llama_model_size(model_tgt);
+                mix(&n_params, sizeof(n_params));
+                mix(&n_bytes, sizeof(n_bytes));
+                {
+                    std::error_code ec;
+                    const std::string & path = params_base.model.path;
+                    const uint64_t fsize = (uint64_t) std::filesystem::file_size(path, ec);
+                    const int64_t  mtime = (int64_t) std::filesystem::last_write_time(path, ec).time_since_epoch().count();
+                    mix(path.data(), path.size());
+                    mix(&fsize, sizeof(fsize));
+                    mix(&mtime, sizeof(mtime));
+                }
+                char tag[32];
+                snprintf(tag, sizeof(tag), "m%016llx", (unsigned long long) fp);
+                // the writer wakes the main loop after each job: it sleeps once every slot is idle, and a block write
+                // that found the queue full, or the checkpoints that just landed, would otherwise wait for a request
+                prompt_cache->disk_on_written = [this]() {
+                    server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                    task.id = queue_tasks.get_new_id();
+                    queue_tasks.post(std::move(task));
+                };
+                // version 3 where both contexts serve rows by position, else version 2; the store keeps no older one.
+                // Version 3 is numbered 4 since 0.2.8 (see SPC_V3), so its entries from 0.2.7 and before go
+                const uint64_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
+                const uint64_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
+                const bool rows = row_tgt > 0 && (!ctx_dft || row_dft > 0);
+                prompt_cache->set_disk(dir, mib ? std::max(1, atoi(mib)) : 16384, mctx != nullptr, tag, rows ? 4 : 2,
+                                       rows ? row_tgt : 0, rows ? row_dft : 0);
+                for (auto & slot : slots) {
+                    slot.disk_cache = prompt_cache.get();
+                }
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1708,9 +2482,9 @@ private:
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mtmd_cap.vision,
-                /* allow_audio           */ mtmd_cap.audio,
-                /* allow_video           */ mtmd_cap.video,
+                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
+                /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+                /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -1773,6 +2547,192 @@ private:
         return nullptr;
     }
 
+    // strixllama: how many positions of `tokens` a slot's conversation can hand over - attention rows and the
+    // recurrent state with them. The slot the prompt goes to keeps its state where it stands, so a prompt that only
+    // appends to its conversation keeps all it shares; any other slot hands over a checkpoint (or, idle and standing
+    // exactly there, its current state). One token is always left to process.
+    int64_t restore_point(const server_slot & s, const server_tokens & tokens, bool own) const {
+        if (s.prompt.tokens.empty() || tokens.empty()) {
+            return 0;
+        }
+        const int64_t lcp = (int64_t) s.prompt.tokens.get_common_prefix(tokens);
+        const int64_t n   = s.prompt.n_tokens();
+        if (lcp == n && lcp < (int64_t) tokens.size() && (own || !s.is_processing())) {
+            return lcp;
+        }
+        int64_t best = 0;
+        for (const auto & c : s.prompt.checkpoints) {
+            if (c.n_tokens <= lcp && c.n_tokens < (int64_t) tokens.size() && c.n_tokens > best) {
+                best = c.n_tokens;
+            }
+        }
+        return best;
+    }
+
+    // strixllama: the other slot (idle or busy) whose conversation hands `tokens` the most positions
+    server_slot * best_prefix_source(const server_slot & dst, const server_tokens & tokens, int64_t & n_best) {
+        server_slot * best = nullptr;
+        n_best = 0;
+        for (auto & s : slots) {
+            if (&s == &dst) {
+                continue;
+            }
+            const int64_t n = restore_point(s, tokens, false);
+            if (n > n_best) {
+                n_best = n;
+                best   = &s;
+            }
+        }
+        return best;
+    }
+
+    // strixllama: the first n positions of another slot's conversation, brought into dst: its attention rows through
+    // the host (llama_strix_kv_get/set_rows, 4096 positions at a time), and the recurrent state at n from its
+    // checkpoint there - or from the slot itself when it is idle and stands at n. A prefix another conversation has
+    // already computed - a shared system prompt, the point a sub-agent forks from - is then read instead of computed
+    // again: tens of milliseconds for 10K positions against ~10 s of prefill. False, and dst emptied, on failure.
+    // strixllama: whether this server's caches can hand rows by position between slots at all (llama_strix_kv_*)
+    bool can_copy_rows() const {
+        return llama_strix_kv_row_size(ctx_tgt) > 0 && (!ctx_dft || llama_strix_kv_row_size(ctx_dft) > 0);
+    }
+
+    // strixllama: whether copy_prefix could take the first n positions of src (rows by position hold no image)
+    bool can_copy_prefix(const server_slot & src, int64_t n) const {
+        if (n <= 0 || !can_copy_rows() || n > (int64_t) src.prompt.n_tokens()) {
+            return false;
+        }
+        const auto media = src.prompt.tokens.find_next_media_chunk(0);
+        return media.first == nullptr || (int64_t) media.second >= n;
+    }
+
+    bool copy_prefix(server_slot & dst, server_slot & src, int64_t n) {
+        const size_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
+        const size_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
+        if (!can_copy_prefix(src, n)) {
+            return false;
+        }
+        const int64_t t0 = ggml_time_us();
+
+        common_prompt_checkpoint own;
+        common_prompt_checkpoint * ck = nullptr;
+        for (auto & c : src.prompt.checkpoints) {
+            if (c.n_tokens == n) {
+                ck = &c;
+            }
+        }
+        if (ck == nullptr) {
+            if (src.is_processing() || (int64_t) src.prompt.n_tokens() != n) {
+                return false;
+            }
+            own.update_pos(n, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), src.id),
+                              llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), src.id));
+            own.update_tgt(ctx_tgt, src.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            own.update_dft(ctx_dft, src.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            common_speculative_get_state(spec.get(), src.id, own.data_spec);
+            ck = &own;
+        } else if (ck->data_tgt.empty()) {             // handed back to the disk tier while its slot was idle
+            if (!prompt_cache || !prompt_cache->ckpt_page_in(src.prompt.tokens, src.ckpt_paged, *ck)) {
+                return false;
+            }
+        }
+
+        llama_tokens text = src.prompt.tokens.get_text_tokens();
+        text.resize((size_t) n);
+
+        dst.prompt_clear();
+        bool ok = llama_strix_kv_alloc(ctx_tgt, dst.id, text.data(), (int32_t) n) &&
+                  (!ctx_dft || llama_strix_kv_alloc(ctx_dft, dst.id, text.data(), (int32_t) n));
+        // the rows go device to device, queued behind the graphs (nothing waited for); through the host only when
+        // a cache cannot do that (or STRIX_COPY_ROWS_HOST=1, for comparing the two)
+        static const bool host_only = getenv("STRIX_COPY_ROWS_HOST") && atoi(getenv("STRIX_COPY_ROWS_HOST")) != 0;
+        bool on_device = ok && !host_only && llama_strix_kv_copy_rows(ctx_tgt, src.id, dst.id, 0, (int32_t) n) &&
+                         (!ctx_dft || llama_strix_kv_copy_rows(ctx_dft, src.id, dst.id, 0, (int32_t) n));
+        std::vector<uint8_t> buf;
+        for (int64_t p0 = 0; ok && !on_device && p0 < n; p0 += 4096) {
+            const int32_t k = (int32_t) std::min<int64_t>(4096, n - p0);
+            buf.resize(row_tgt * k);
+            ok = llama_strix_kv_get_rows(ctx_tgt, src.id, (llama_pos) p0, k, buf.data(), buf.size()) &&
+                 llama_strix_kv_set_rows(ctx_tgt, dst.id, (llama_pos) p0, k, buf.data(), k);
+            if (ok && ctx_dft) {
+                buf.resize(row_dft * k);
+                ok = llama_strix_kv_get_rows(ctx_dft, src.id, (llama_pos) p0, k, buf.data(), buf.size()) &&
+                     llama_strix_kv_set_rows(ctx_dft, dst.id, (llama_pos) p0, k, buf.data(), k);
+            }
+        }
+        ok = ok && llama_state_seq_set_data_ext(ctx_tgt, ck->data_tgt.data(), ck->data_tgt.size(), dst.id,
+                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == ck->data_tgt.size();
+        ok = ok && (!ctx_dft || ck->data_dft.empty() ||
+                    llama_state_seq_set_data_ext(ctx_dft, ck->data_dft.data(), ck->data_dft.size(), dst.id,
+                                                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == ck->data_dft.size());
+        if (!ok) {
+            SLT_WRN(dst, "could not copy %" PRId64 " positions from slot %d; processing the prompt instead\n", n, src.id);
+            dst.prompt_clear();
+            return false;
+        }
+        common_speculative_set_state(spec.get(), dst.id, ck->data_spec);
+
+        dst.prompt.tokens = src.prompt.tokens.clone();
+        dst.prompt.tokens.keep_first((size_t) n);
+        dst.prompt.checkpoints.clear();
+        dst.prompt.checkpoints.push_back(*ck);         // a rewind to it works here too
+        dst.prompt.checkpoints.back().id_task = -1;
+
+        SLT_INF(dst, "copied %" PRId64 " positions from slot %d (%s, %.3f GiB, %s) in %.0f ms\n", n, src.id,
+                ck == &own ? "its state" : "its checkpoint", (double) n * (row_tgt + row_dft) / (1024.0 * 1024.0 * 1024.0),
+                on_device ? "on the device" : "through the host", (ggml_time_us() - t0) / 1000.0);
+        return true;
+    }
+
+    // strixllama: a prompt whose prefix a busy slot is computing right now - sub-agents started together with one
+    // system prompt - waits until that slot is past its anchor there (the last user message of its prompt, which always
+    // gets a checkpoint, and with STRIX_CKPT_ANCHORS the first), then copies it (copy_prefix) instead of computing it a
+    // second time alongside. The
+    // same GPU does the work either way: the waiting prompt starts no later, and the one it waits for finishes sooner.
+    // STRIX_PREFIX_WAIT=0 turns it off.
+    bool wait_for_prefix(server_task & task) {
+        static const bool on = !getenv("STRIX_PREFIX_WAIT") || atoi(getenv("STRIX_PREFIX_WAIT")) != 0;
+        task.wait_slot = -1;
+        if (!on || task.tokens.empty() || task.type != SERVER_TASK_TYPE_COMPLETION || task.id_slot != -1 || task.is_parent() ||
+                params_base.n_ctx_checkpoints <= 0 || !can_copy_rows()) {
+            return false;
+        }
+        if (task.wait_t0 != 0 && ggml_time_us() - task.wait_t0 > 120 * 1000 * 1000) {
+            SRV_WRN("task %d waited two minutes for another slot's prefix; processing it instead\n", task.id);
+            return false;
+        }
+        const auto media = task.tokens.find_next_media_chunk(0);
+        int64_t n_now = 0;                             // what is on offer already
+        for (const auto & s : slots) {
+            n_now = std::max(n_now, restore_point(s, task.tokens, !s.is_processing()));
+        }
+        for (const auto & s : slots) {
+            if ((s.state != SLOT_STATE_STARTED && s.state != SLOT_STATE_PROCESSING_PROMPT) || !s.task) {
+                continue;
+            }
+            const int64_t lcp = (int64_t) s.task->tokens.get_common_prefix(task.tokens);
+            const auto & spans = s.task->params.message_spans;
+            int64_t anchor = -1;
+            for (const int64_t p : { ckpt_anchors() ? (int64_t) spans.first_user_message_pos() : -1, (int64_t) spans.last_user_message_pos() }) {
+                if (p > 0 && p <= lcp && p < (int64_t) task.tokens.size() && p > anchor) {
+                    anchor = p;
+                }
+            }
+            if (anchor < n_now + 1024 || (int64_t) s.prompt.n_tokens() > anchor ||
+                    (media.first != nullptr && (int64_t) media.second < anchor)) {
+                continue;                              // not worth a wait, already there, or no copy of it could follow
+            }
+            task.wait_slot = s.id;
+            task.wait_n    = anchor;
+            if (task.wait_t0 == 0) {
+                task.wait_t0 = ggml_time_us();
+                SRV_INF("task %d waits for slot %d to reach %" PRId64 " tokens of the prefix they share (%" PRId64 " on offer now)\n",
+                        task.id, s.id, anchor, n_now);
+            }
+            return true;
+        }
+        return false;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1791,8 +2751,66 @@ private:
             }
         }
 
-        // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        // strixllama: agents run several sessions on one long system prompt, so any two of them share most of their
+        // tokens, and the slot sharing the most with a prompt was often another session's. Taking it cut that
+        // session's own history - its task, answers and tool results - while f_keep stayed above 0.75 (the system
+        // prompt was most of the slot), and the session then processed all of it again on its next step: six agents
+        // on four slots went back to the system prompt on nearly every step. A slot takes a prompt for what it holds
+        // only when the prompt continues it - keeps all that was last asked there, less the few tokens a template
+        // renders differently once the answer is in the history: a next turn, a next agent step, a regenerate.
+        // Anything else goes to a free slot, else the least recently used one (below), and the part it shares with
+        // any slot is copied in (copy_prefix). The exception keeps the old choice: a shared part worth keeping that
+        // cannot be copied (an image in it). STRIX_SLOT_BY_SIMILARITY=1: upstream's choice by similarity.
+        static const bool by_similarity = [] {
+            const char * e = getenv("STRIX_SLOT_BY_SIMILARITY");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (task.id_slot == -1 && slot_prompt_similarity != 0.0f && !by_similarity) {
+            server_slot * best = nullptr;
+            size_t lcp_best = 0;
+            size_t lcp_own  = 0;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing() || slot.prompt.tokens.empty()) {
+                    continue;
+                }
+                const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+                if (lcp > lcp_best) {
+                    lcp_best = lcp;
+                    best     = &slot;
+                }
+                const size_t n_last = slot.task_prev ? slot.task_prev->tokens.size() : slot.prompt.tokens.size();
+                // issue #19: with the slot's own sampled tokens of an earlier answer counted as the splice keeps them
+                const size_t lcp_cont = std::max(lcp, splice_own_keep(slot, task));
+                if (lcp_cont > lcp_own && lcp_cont + 16 >= n_last) {
+                    lcp_own = lcp_cont;
+                    ret     = &slot;
+                } else if (lcp >= 4096) {
+                    SLT_INF(slot, "shares %zu tokens (%zu with the splice) of its %zu last prompt tokens: not continued\n",
+                            lcp, lcp_cont, n_last);
+                }
+            }
+            if (ret != nullptr) {
+                SLT_INF(*ret, "selected slot: the prompt continues it (%zu of its %d tokens kept)\n", lcp_own, ret->prompt.n_tokens());
+            } else if (best != nullptr) {
+                const int64_t n_shared = restore_point(*best, task.tokens, false);
+                if (n_shared >= 256 && !can_copy_prefix(*best, n_shared)) {
+                    ret = best;
+                    update_cache = lcp_best < best->prompt.tokens.size() / 2;
+                    SLT_INF(*ret, "selected slot: %" PRId64 " shared tokens that cannot be copied\n", n_shared);
+                }
+            }
+            if (ret == nullptr) {
+                for (server_slot & slot : slots) {
+                    if (!slot.is_processing() && slot.prompt.tokens.empty()) {
+                        ret = &slot;
+                        update_cache = true;
+                        SLT_INF(slot, "%s", "selected free slot; a shared prefix is copied in\n");
+                        break;
+                    }
+                }
+            }
+        } else if (slot_prompt_similarity != 0.0f) {
+            // find the slot that has at least n% prompt similarity
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -1829,7 +2847,11 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                // strixllama: a slot named by id that holds nothing has nothing to keep - 0/0 here was a NaN, which
+                // compares false, so such a slot skipped the prompt cache and a long conversation sent back to its
+                // emptied slot was processed again from its first token instead of read back from the disk tier
+                const float f_keep = ret->prompt.tokens.empty() ? 0.0f :
+                    (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
@@ -1839,6 +2861,23 @@ private:
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
+                }
+
+                // strixllama: the slot that shares the most holds another conversation, a quarter or more of which
+                // would be cut: a free slot takes the prompt instead, the shared part is copied into it (copy_prefix
+                // below), and that conversation stays where it is. The free slot still looks in the RAM and disk
+                // tiers (update_cache), which may hold more of this prompt than the shared part. Not when the shared
+                // part could not be copied (an image in it) and is worth keeping: then it is cut from that slot
+                const int64_t n_shared = restore_point(*ret, task.tokens, false);
+                if (task.id_slot == -1 && f_keep < 0.75f && (n_shared < 256 || can_copy_prefix(*ret, n_shared))) {
+                    for (server_slot & slot : slots) {
+                        if (!slot.is_processing() && slot.prompt.tokens.empty()) {
+                            SLT_INF(slot, "free slot taken instead of slot %d (f_keep = %.3f); the shared prefix is copied\n", ret->id, f_keep);
+                            ret = &slot;
+                            update_cache = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1857,6 +2896,49 @@ private:
         }
 
         if (ret) {
+            // strixllama: a slot named by id can be busy; its KV is not to be swapped from the cache under a running
+            // generation - the task is deferred once this returns
+            if (ret->is_processing()) {
+                return ret;
+            }
+
+            // strixllama: another slot's conversation - idle or busy - that hands this prompt more positions than the
+            // chosen slot keeps (copy_prefix): found first, so that making room does not purge it
+            int64_t n_src = 0;
+            server_slot * src = task.type == SERVER_TASK_TYPE_COMPLETION ? best_prefix_source(*ret, task.tokens, n_src) : nullptr;
+
+            // room for this prompt and a margin to generate into, before anything is restored
+            const size_t margin = task.params.n_predict > 0 ? (size_t) std::min<int32_t>(task.params.n_predict, 32768) : 4096;
+            if (task.type == SERVER_TASK_TYPE_COMPLETION) {
+                // strixllama: with the pool guard the prompt starts only when it fits beside what the busy conversations
+                // will hold, and waits in the queue until then; the conversation it would copy from stays only if that
+                // fits as well
+                if (pool_guard_on() && params_base.kv_unified && !task.is_parent() && pool_any_busy()) {
+                    const int64_t need = (int64_t) task.tokens.size() + pool_answer_room(task_n_predict(task));
+                    if (!pool_fits(need, ret, src)) {
+                        if (src == nullptr || !pool_fits(need, ret, nullptr)) {
+                            pool_deferred = true;
+                            return nullptr;
+                        }
+                        src   = nullptr;
+                        n_src = 0;
+                    }
+                    make_room(*ret, (size_t) need, src, /* future = */ true);
+                }
+                if (!make_room(*ret, task.tokens.size() + margin, src) && src != nullptr && src != ret && !src->is_processing()) {
+                    // issue #19: the pool cannot hold this prompt beside the conversation it would copy from (the only
+                    // idle one): the prompt takes that conversation's slot and continues from their shared prefix,
+                    // instead of a copy (no cells), a disk restore (no cells) and the whole prompt computed
+                    SLT_INF(*ret, "no room beside slot %d to copy %" PRId64 " shared tokens: the prompt takes slot %d itself\n",
+                            src->id, n_src, src->id);
+                    ret          = src;
+                    src          = nullptr;
+                    n_src        = 0;
+                    update_cache = false;
+                    make_room(*ret, task.tokens.size() + margin, nullptr);
+                }
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
@@ -1869,13 +2951,27 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // an entry longer than the prompt (an edit deep in a long conversation) needs room for all of it
+                if (!ret->prompt_load(*prompt_cache, task.tokens, [&](size_t n_entry) { make_room(*ret, n_entry + margin, src); })) {
                     ret->prompt_clear();
                 }
 
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            if (src != nullptr) {
+                const int64_t n_own = restore_point(*ret, task.tokens, true);
+                if (n_src >= n_own + 256) {
+                    // what the slot holds goes to the prompt cache first: its own conversation, or the entry the
+                    // load just took out of the RAM tier (entries leave it when they are restored)
+                    if (!ret->prompt.tokens.empty() && prompt_cache) {
+                        ret->prompt_save(*prompt_cache);
+                        prompt_cache->update();
+                    }
+                    copy_prefix(*ret, *src, n_src);
+                }
             }
         }
 
@@ -1887,31 +2983,201 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
-        bool res = false;
-
-        if (!params_base.kv_unified) {
-            return res;
+    // strixllama: conversations stay in their slots - with a unified KV the cells are allocated at load, so
+    // keeping one costs nothing until the pool is actually full (run with --no-cache-idle-slots, which stops
+    // upstream from saving and clearing every idle slot on each new task). They reach disk here instead: in
+    // blocks, whenever the server is idle and one has grown by disk_block tokens since it was last written.
+    // A restart then loses at most a block, and evicting a conversation later costs nothing. The main loop
+    // pays for the gather; a background thread writes, and only what changed.
+    void persist_idle_slots() {
+        if (!prompt_cache || !prompt_cache->has_disk() || prompt_cache->disk_block <= 0) {
+            return;
         }
-
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            const int32_t n = slot.prompt.n_tokens();
+            if (slot.is_processing() || n == 0 || slot.n_tokens_persist_checked == n) {
                 continue;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (slot.prompt.tokens.get_text_tokens().size() != (size_t) n) {
+                slot.n_tokens_persist_checked = n;          // media: the disk tier does not store it
+                continue;
+            }
+            // version 3: the runs the conversation filled while it was busy and the writer turned away; the rest,
+            // and the recurrent state, only when it leaves its slot - nothing is written twice
+            if (llama_strix_kv_row_size(slot.ctx_tgt) > 0 && (!slot.ctx_dft || llama_strix_kv_row_size(slot.ctx_dft) > 0)) {
+                if (slot.persist_runs(*prompt_cache, /* leaving = */ false, /* wait = */ false)) {
+                    slot.n_tokens_persist_checked = n;
+                }
+                continue;
+            }
+            const size_t block   = (size_t) prompt_cache->disk_block;
+            const size_t stored  = prompt_cache->disk_covered(slot.prompt.tokens, /* with_jobs = */ false);
+            const size_t pending = prompt_cache->disk_covered(slot.prompt.tokens, /* with_jobs = */ true);
+            if ((size_t) n < stored + block) {
+                slot.n_tokens_persist_checked = n;          // on disk to within a block: settled until it grows
+                continue;
+            }
+            if ((size_t) n < pending + block) {
+                continue;                                   // a write in flight covers it: look again when it lands
+            }
+            // queued or not, the writer wakes the loop when its current job is done and this runs again, so a
+            // save the queue turned away - or one that failed - is retried rather than forgotten
+            slot.prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ false);
+        }
+        // checkpoints are cold data - only a rewind reads one - so those the store holds leave memory; a
+        // warm conversation of 79K tokens otherwise keeps 3.4 GB of them in system RAM
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.checkpoints.empty()) {
+                continue;
+            }
+            const uint64_t freed = prompt_cache->ckpt_page_out(slot.prompt.tokens, slot.prompt.checkpoints, slot.ckpt_paged);
+            if (freed > 0) {
+                SLT_INF(slot, "handed %.3f GiB of checkpoints back to the disk tier\n", freed / (1024.0 * 1024.0 * 1024.0));
             }
         }
+    }
 
-        return res;
+    // strixllama: the pool guard. The unified KV pool is shared by every conversation, and upstream fails every
+    // request of a step that does not fit in it, and clears their caches: on 2026-09-28 eight agents held ~870K tokens
+    // in a 680K pool and seven failed at once. With the guard (STRIX_POOL_GUARD=0: as upstream)
+    // - a prompt starts only when it fits beside what the busy conversations will hold - their prompts and a reserve
+    //   for their answers - once the idle ones are on disk; until then it waits in the queue, holding no slot
+    // - a prompt's next piece and an answer's next tokens go into a step only as far as there are cells; otherwise
+    //   they wait for another conversation to finish
+    // - when every busy conversation waits for cells, the one that arrived last gives way: a prompt with an error a
+    //   client may retry, an answer by ending as if its context were full
+    static bool pool_guard_on() {
+        static const bool on = !getenv("STRIX_POOL_GUARD") || atoi(getenv("STRIX_POOL_GUARD")) != 0;
+        return on;
+    }
+
+    static constexpr int64_t POOL_STEP_MARGIN = 16;   // cells a step leaves free
+    static constexpr int64_t POOL_ANSWER_KEEP = 64;   // cells a prompt piece leaves each answer being generated
+
+    // the reserve for an answer: 8192 tokens (STRIX_POOL_ANSWER_ROOM, for tests), less when the request allows less
+    static int64_t pool_answer_room(int32_t n_predict) {
+        static const int64_t room = getenv("STRIX_POOL_ANSWER_ROOM") ? std::max(atoi(getenv("STRIX_POOL_ANSWER_ROOM")), 16) : 8192;
+        return n_predict > 0 ? std::min<int64_t>(n_predict, room) : room;
+    }
+
+    int32_t task_n_predict(const server_task & task) const {
+        return task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+    }
+
+    // the cells a conversation will hold: an idle one what it holds, a busy one its whole prompt and the reserve for
+    // its answer - an eighth of it more once the answer has outgrown it
+    int64_t pool_future(const server_slot & s) const {
+        const int64_t n = s.prompt.n_tokens();
+        if (!s.is_processing() || !s.task) {
+            return n;
+        }
+        if (s.state == SLOT_STATE_GENERATING) {
+            const int64_t room = pool_answer_room(-1);
+            int64_t r = std::max<int64_t>(room - (int64_t) s.stats.n_gen, room / 8);
+            if (s.n_predict_max > 0) {
+                r = std::min<int64_t>(r, std::max<int64_t>((int64_t) s.n_predict_max - s.stats.n_gen, 0));
+            }
+            return n + r;
+        }
+        return std::max<int64_t>(n, s.task->n_tokens()) + pool_answer_room(s.n_predict_max);
+    }
+
+    bool pool_any_busy() const {
+        return std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); });
+    }
+
+    // whether `need` more cells fit beside what the busy conversations will hold, the idle ones but `keep` on disk and
+    // `target`'s own cells replaced
+    bool pool_fits(int64_t need, const server_slot * target = nullptr, const server_slot * keep = nullptr) const {
+        int64_t used = 0;
+        for (const auto & s : slots) {
+            if (&s == target) {
+                continue;
+            }
+            if (s.is_processing()) {
+                used += pool_future(s);
+            } else if (&s == keep) {
+                used += s.prompt.n_tokens();
+            }
+        }
+        return used + need <= (int64_t) llama_n_ctx(ctx_tgt);
+    }
+
+    // cells of the unified pool no conversation holds
+    int64_t pool_free() const {
+        int64_t used = 0;
+        for (const auto & s : slots) {
+            used += s.prompt.n_tokens();
+        }
+        return (int64_t) llama_n_ctx(ctx_tgt) - used;
+    }
+
+    // strixllama: before `target` takes a prompt of `need` tokens, free least recently used idle slots - on
+    // disk first - until the other conversations and this one fit in the unified pool. Kept conversations can
+    // fill it, and a restore from the cache needs free cells: without them it fails and the whole prompt is
+    // processed instead, where the decode path would only have purged idle slots once prefill ran out.
+    // With `future` a busy conversation counts for what it will hold (pool_future). False: they do not fit.
+    bool make_room(const server_slot & target, size_t need, const server_slot * keep = nullptr, bool future = false) {
+        if (!params_base.kv_unified) {
+            return true;
+        }
+        const size_t n_pool = llama_n_ctx(ctx_tgt);
+        while (true) {
+            size_t used = 0;
+            for (const auto & slot : slots) {
+                if (&slot != &target) {
+                    used += future ? (size_t) pool_future(slot) : (size_t) slot.prompt.n_tokens();
+                }
+            }
+            if (used + need <= n_pool) {
+                return true;
+            }
+            server_slot * victim = nullptr;
+            for (auto & slot : slots) {
+                if (&slot == &target || &slot == keep || slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                    continue;
+                }
+                if (!victim || slot.t_last_used < victim->t_last_used) {
+                    victim = &slot;
+                }
+            }
+            if (!victim) {
+                return false;                               // the rest are busy (see pool_guard_on)
+            }
+            if (prompt_cache && prompt_cache->has_disk()) {
+                victim->prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ true);
+            }
+            SRV_INF("making room for %zu tokens (pool %zu, other slots %zu): purging slot %d with %d tokens\n",
+                    need, n_pool, used, victim->id, victim->prompt.n_tokens());
+            victim->prompt_clear();
+        }
+    }
+
+    // the pool is full: free the least recently used idle slot, on disk first if the disk tier lacks it
+    // (upstream purged the first idle slot it found, and did not save it)
+    bool try_clear_idle_slots() {
+        if (!params_base.kv_unified) {
+            return false;
+        }
+
+        server_slot * victim = nullptr;
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (!victim || slot.t_last_used < victim->t_last_used) {
+                victim = &slot;
+            }
+        }
+        if (!victim) {
+            return false;
+        }
+        if (prompt_cache && prompt_cache->has_disk()) {
+            victim->prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ true);
+        }
+        SRV_WRN("purging slot %d with %zu tokens\n", victim->id, victim->prompt.tokens.size());
+        victim->prompt_clear();
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -1925,6 +3191,385 @@ private:
             }
         }
         return output;
+    }
+
+    // strixllama: a conversation's next request (a tool call's follow-up, an agent step, the next chat turn) sends the
+    // model's own answer back as text. The chat template renders that text byte for byte as it was generated, but
+    // tokenizing it again does not always give the tokens the model sampled (a word it produced in two pieces comes
+    // back as one), so the cached prefix stopped inside the answer and everything after the nearest checkpoint - the
+    // reasoning and the calls - was processed again: 7K of a 7.8K-token follow-up for two web searches, 5.7K tokens of
+    // a 31K chat turn (10-08/09). When the text after the common prefix starts with the text of the slot's own
+    // remaining tokens, those tokens are kept as they are and only the text after them is tokenized again; the slot
+    // continues where its answer ended. The tokens the model sees are the ones it produced, which is what its cache
+    // holds. The cut falls at a token of the slot's own on a character boundary, or after an image; at least 16
+    // tokens. Images go along: one of the slot's is kept where the prompt has the same image (by its id) at the same
+    // place, and the prompt's images after the cut - a screenshot with every turn - follow as they came. The template
+    // also trims an answer's content, so whitespace the model ended it with is missing from the text: when all the
+    // slot has left is whitespace and the text continues with the end of the turn, the slot keeps it too.
+    // strixllama: how many of the slot's tokens splice_own_tokens would keep for this prompt (the common prefix plus
+    // the slot's own tokens whose text the prompt continues with), 0 when it would not splice. The same walk as
+    // splice_own_tokens, nothing changed; slot selection uses it (issue #19: the raw common prefix stops inside an
+    // earlier answer whose sampled tokens differ from the re-tokenized text, and the slot lost its own next step)
+    size_t splice_own_keep(const server_slot & slot, const server_task & task) {
+        static const bool on = !getenv("STRIX_SPLICE_OWN") || atoi(getenv("STRIX_SPLICE_OWN")) != 0;
+        if (!on || !task.params.cache_prompt || slot.prompt.tokens.empty() || task.tokens.empty()) {
+            return 0;
+        }
+        const server_tokens & ct = slot.prompt.tokens;
+        const server_tokens & pt = task.tokens;
+        const size_t k = ct.get_common_prefix(pt);
+        if (k == 0 || ct.size() <= k || pt.size() <= k) {
+            return 0;
+        }
+        const auto n_media = [](const server_tokens & t, size_t i) {
+            return (size_t) mtmd_input_chunk_get_n_tokens(t.find_chunk(i).get());
+        };
+        struct run {
+            size_t      b, e;
+            bool        media;
+            std::string text;
+            size_t      n_text;
+        };
+        std::vector<run> runs;
+        for (size_t i = k; i < pt.size(); ) {
+            const bool media = pt[i] == LLAMA_TOKEN_NULL;
+            size_t e = i;
+            if (media) {
+                e = i + n_media(pt, i);
+            } else {
+                while (e < pt.size() && pt[e] != LLAMA_TOKEN_NULL) {
+                    ++e;
+                }
+            }
+            runs.push_back({ i, e, media, std::string(), i });
+            i = e;
+        }
+        const auto text_to = [&](run & x, size_t n) {
+            while (x.text.size() < n && x.n_text < x.e) {
+                x.text += common_token_to_piece(ctx_tgt, pt[x.n_text++], true);
+            }
+            return x.text.size() >= n;
+        };
+        size_t i = k, r = 0, off = 0, n_keep = 0, r_keep = 0, off_keep = 0;
+        while (i < ct.size() && r < runs.size()) {
+            if (ct[i] == LLAMA_TOKEN_NULL) {
+                size_t rm = r;
+                if (!runs[rm].media) {
+                    text_to(runs[rm], std::string::npos);
+                    if (off != runs[rm].text.size() || ++rm >= runs.size() || !runs[rm].media) {
+                        break;
+                    }
+                }
+                const mtmd_input_chunk * a = ct.find_chunk(i).get();
+                const mtmd_input_chunk * b = pt.find_chunk(runs[rm].b).get();
+                const size_t n = mtmd_input_chunk_get_n_tokens(a);
+                if (n != mtmd_input_chunk_get_n_tokens(b) ||
+                        std::string(mtmd_input_chunk_get_id(a)) != std::string(mtmd_input_chunk_get_id(b))) {
+                    break;
+                }
+                i += n;
+                r = rm + 1;
+                off = 0;
+                n_keep   = i - k;
+                r_keep   = r;
+                off_keep = 0;
+                continue;
+            }
+            run & x = runs[r];
+            if (x.media) {
+                break;
+            }
+            const std::string piece = common_token_to_piece(ctx_tgt, ct[i], true);
+            if (piece.empty() || !text_to(x, off + piece.size()) || x.text.compare(off, piece.size(), piece) != 0) {
+                break;
+            }
+            off += piece.size();
+            ++i;
+            if (text_to(x, off + 1) && ((unsigned char) x.text[off] & 0xC0) == 0x80) {
+                continue;
+            }
+            n_keep   = i - k;
+            r_keep   = r;
+            off_keep = off;
+        }
+        bool ws_tail = false;
+        if (i < ct.size() && k + n_keep == i && r == r_keep && r_keep < runs.size() && !runs[r_keep].media &&
+                text_to(runs[r_keep], off_keep + 1)) {
+            bool all_ws = true;
+            for (size_t j = i; j < ct.size() && all_ws; ++j) {
+                const std::string piece = ct[j] == LLAMA_TOKEN_NULL ? std::string() : common_token_to_piece(ctx_tgt, ct[j], true);
+                all_ws = !piece.empty() && piece.find_first_not_of(" \t\r\n") == std::string::npos;
+            }
+            bool turn_end = false;
+            for (const llama_token eog : { llama_vocab_eot(vocab), llama_vocab_eos(vocab) }) {
+                if (eog == LLAMA_TOKEN_NULL) {
+                    continue;
+                }
+                const std::string piece = common_token_to_piece(ctx_tgt, eog, true);
+                turn_end = turn_end || (!piece.empty() && text_to(runs[r_keep], off_keep + piece.size()) &&
+                                        runs[r_keep].text.compare(off_keep, piece.size(), piece) == 0);
+            }
+            if (all_ws && turn_end) {
+                n_keep  = ct.size() - k;
+                ws_tail = true;
+            }
+        }
+        if ((!ws_tail && n_keep < 16) || n_keep == 0) {
+            return 0;
+        }
+        return k + n_keep;
+    }
+
+    // STRIX_SPLICE_OWN=0: off.
+    void splice_own_tokens(server_slot & slot, server_task & task) {
+        static const bool on = !getenv("STRIX_SPLICE_OWN") || atoi(getenv("STRIX_SPLICE_OWN")) != 0;
+        if (!on || !task.params.cache_prompt || slot.prompt.tokens.empty() || task.tokens.empty()) {
+            return;
+        }
+        const server_tokens & ct = slot.prompt.tokens; // indexed: get_tokens() refuses prompts that may hold media
+        const server_tokens & pt = task.tokens;
+        const size_t k = ct.get_common_prefix(pt);
+        if (k == 0 || ct.size() <= k || pt.size() <= k) {
+            return;
+        }
+        const auto n_media = [](const server_tokens & t, size_t i) {
+            return (size_t) mtmd_input_chunk_get_n_tokens(t.find_chunk(i).get());
+        };
+        // the prompt after the common prefix in runs: text (its text built only as far as it is read) or one media chunk
+        struct run {
+            size_t      b, e;
+            bool        media;
+            std::string text;
+            size_t      n_text; // tokens of the run in text so far
+        };
+        std::vector<run> runs;
+        for (size_t i = k; i < pt.size(); ) {
+            const bool media = pt[i] == LLAMA_TOKEN_NULL;
+            size_t e = i;
+            if (media) {
+                e = i + n_media(pt, i);
+            } else {
+                while (e < pt.size() && pt[e] != LLAMA_TOKEN_NULL) {
+                    ++e;
+                }
+            }
+            runs.push_back({ i, e, media, std::string(), i });
+            i = e;
+        }
+        const auto text_to = [&](run & x, size_t n) {
+            while (x.text.size() < n && x.n_text < x.e) {
+                x.text += common_token_to_piece(ctx_tgt, pt[x.n_text++], true);
+            }
+            return x.text.size() >= n;
+        };
+        // walk the slot's remaining tokens along the prompt; at a cut, n_keep of them are kept and the prompt resumes
+        // in run r_keep at off_keep
+        std::vector<size_t> media_at; // for each of the slot's images kept, where the prompt's copy of it starts
+        size_t i = k, r = 0, off = 0, n_keep = 0, r_keep = 0, off_keep = 0;
+        while (i < ct.size() && r < runs.size()) {
+            if (ct[i] == LLAMA_TOKEN_NULL) {
+                // an image of the slot's: the prompt must have the same one next, after the whole of its text run
+                size_t rm = r;
+                if (!runs[rm].media) {
+                    text_to(runs[rm], std::string::npos);
+                    if (off != runs[rm].text.size() || ++rm >= runs.size() || !runs[rm].media) {
+                        break;
+                    }
+                }
+                const mtmd_input_chunk * a = ct.find_chunk(i).get();
+                const mtmd_input_chunk * b = pt.find_chunk(runs[rm].b).get();
+                const size_t n = mtmd_input_chunk_get_n_tokens(a);
+                if (n != mtmd_input_chunk_get_n_tokens(b) ||
+                        std::string(mtmd_input_chunk_get_id(a)) != std::string(mtmd_input_chunk_get_id(b))) {
+                    break;
+                }
+                media_at.push_back(runs[rm].b);
+                i += n;
+                r = rm + 1;
+                off = 0;
+                n_keep   = i - k;
+                r_keep   = r;
+                off_keep = 0;
+                continue;
+            }
+            run & x = runs[r];
+            if (x.media) {
+                break;
+            }
+            const std::string piece = common_token_to_piece(ctx_tgt, ct[i], true);
+            if (piece.empty() || !text_to(x, off + piece.size()) || x.text.compare(off, piece.size(), piece) != 0) {
+                break;
+            }
+            off += piece.size();
+            ++i;
+            if (text_to(x, off + 1) && ((unsigned char) x.text[off] & 0xC0) == 0x80) {
+                continue; // inside a multi-byte character: not a place to cut
+            }
+            n_keep   = i - k;
+            r_keep   = r;
+            off_keep = off;
+        }
+        // the trimmed end of an answer: whitespace only left in the slot, the end of the turn next in the text
+        bool ws_tail = false;
+        if (i < ct.size() && k + n_keep == i && r == r_keep && r_keep < runs.size() && !runs[r_keep].media &&
+                text_to(runs[r_keep], off_keep + 1)) {
+            bool all_ws = true;
+            for (size_t j = i; j < ct.size() && all_ws; ++j) {
+                const std::string piece = ct[j] == LLAMA_TOKEN_NULL ? std::string() : common_token_to_piece(ctx_tgt, ct[j], true);
+                all_ws = !piece.empty() && piece.find_first_not_of(" \t\r\n") == std::string::npos;
+            }
+            bool turn_end = false;
+            for (const llama_token eog : { llama_vocab_eot(vocab), llama_vocab_eos(vocab) }) {
+                if (eog == LLAMA_TOKEN_NULL) {
+                    continue;
+                }
+                const std::string piece = common_token_to_piece(ctx_tgt, eog, true);
+                turn_end = turn_end || (!piece.empty() && text_to(runs[r_keep], off_keep + piece.size()) &&
+                                        runs[r_keep].text.compare(off_keep, piece.size(), piece) == 0);
+            }
+            if (all_ws && turn_end) {
+                n_keep  = ct.size() - k;
+                ws_tail = true;
+            }
+        }
+        if ((!ws_tail && n_keep < 16) || n_keep == 0) {
+            return;
+        }
+        // after the kept tokens: the rest of a run cut inside its text, tokenized again, then the prompt's runs as they are
+        std::string rest_text;
+        size_t r_next = r_keep;
+        if (r_keep < runs.size() && !runs[r_keep].media && off_keep > 0) {
+            text_to(runs[r_keep], std::string::npos);
+            rest_text = runs[r_keep].text.substr(off_keep);
+            r_next    = r_keep + 1;
+        }
+        if (rest_text.empty() && r_next >= runs.size()) {
+            return; // nothing of the prompt after them
+        }
+        // the new tail after the common prefix, its images copied before the prompt lets go of them
+        struct item {
+            llama_token           tok;
+            mtmd::input_chunk_ptr media;
+        };
+        std::vector<item> tail;
+        size_t n_tail = 0;
+        const auto add_media = [&](size_t at) {
+            tail.push_back({ LLAMA_TOKEN_NULL, mtmd::input_chunk_ptr(mtmd_input_chunk_copy(pt.find_chunk(at).get())) });
+            n_tail += n_media(pt, at);
+        };
+        const auto add_tok = [&](llama_token t) {
+            tail.push_back({ t, nullptr });
+            n_tail++;
+        };
+        // the slot's own tokens; its images from the prompt, which has their data (the slot may hold placeholders)
+        for (size_t j = k, m = 0; j < k + n_keep; ) {
+            if (ct[j] == LLAMA_TOKEN_NULL) {
+                add_media(media_at[m]);
+                j += n_media(pt, media_at[m++]);
+            } else {
+                add_tok(ct[j++]);
+            }
+        }
+        if (!rest_text.empty()) {
+            for (const llama_token t : common_tokenize(ctx_tgt, rest_text, false, true)) {
+                add_tok(t);
+            }
+        }
+        for (size_t j = r_next < runs.size() ? runs[r_next].b : pt.size(); j < pt.size(); ) {
+            if (pt[j] == LLAMA_TOKEN_NULL) {
+                const size_t n = n_media(pt, j);
+                add_media(j);
+                j += n;
+            } else {
+                add_tok(pt[j++]);
+            }
+        }
+        if ((int64_t) (k + n_tail) >= (int64_t) slot.n_ctx) {
+            return;
+        }
+        const size_t n_before = pt.size();
+        const size_t n_img = media_at.size();
+        task.tokens.keep_first(k); // pt[k] is text here, so the common prefix ends at a chunk boundary
+        for (auto & it : tail) {
+            if (it.media) {
+                task.tokens.push_back(it.media.get());
+            } else {
+                task.tokens.push_back(it.tok);
+            }
+        }
+        if (task.params.message_delims) {
+            task.params.message_spans = task.tokens.find_message_spans(*task.params.message_delims);
+        }
+        SLT_INF(slot, "own tokens kept: %zu more of its %zu (common prefix %zu%s%s); prompt %zu -> %zu tokens\n",
+                n_keep, ct.size(), k, ws_tail ? ", trimmed whitespace" : "",
+                n_img ? (", " + std::to_string(n_img) + " image(s) with them").c_str() : "", n_before, task.tokens.size());
+    }
+
+    // strixllama (issue #18): STRIX_SPEC_LEN_ADAPT=0 keeps the sampled table's length (2.4.1 - 0.5.5)
+    static bool spec_len_on() {
+        static const bool on = !getenv("STRIX_SPEC_LEN_ADAPT") || atoi(getenv("STRIX_SPEC_LEN_ADAPT")) != 0;
+        return on;
+    }
+
+    // the table's length (0) or one more (1), for a block of SPEC_LEN_BLOCK passes: the one with more tokens a second.
+    // Tokens a pass: 1 + acc1 + acc2 for the shorter, plus acc2 * acc2 / acc1 for the longer - the third position
+    // accepted as often after the second as the second after the first, which came within 0.05 of the measurement on
+    // code, an agent and prose (10-10). The longer pass's time over the shorter's: 1.14 at short contexts (12-14%
+    // measured on all three), rising with the context to 1.30 at 85K (one more position 18.5 ms there,
+    // docs/decode-budget.md). Times measured while it runs went stale - a length not chosen is not timed again - and
+    // kept code at the short draft, so they only go to the log. Nothing is spent finding out: acc1 and acc2 show in
+    // every pass
+    static constexpr int    SPEC_LEN_BLOCK   = 32;
+    static constexpr int    SPEC_LEN_UNTIMED = 2;
+    static int choose_spec_len(server_slot & slot) {
+        auto & st = slot.spec_len;
+        if (st.block_left <= 0) {
+            ++st.block;
+            int arm = 0;
+            if (st.n_acc >= 16 && st.acc1 > 0.0) {
+                const double ctx   = (double) slot.prompt.n_tokens();
+                const double ratio = 1.14 + 0.16 * std::min(ctx / 85000.0, 1.5);
+                const double tok0  = 1.0 + st.acc1 + st.acc2;
+                const double tok1  = tok0 + st.acc2 * std::min(1.0, st.acc2 / st.acc1);
+                // the longer draft only when it is clearly ahead: near the line the estimate's error decides
+                arm = tok1 / ratio > 1.02 * tok0 ? 1 : 0;
+            }
+            st.block_untimed = arm != st.block_arm ? SPEC_LEN_UNTIMED : 0;
+            st.block_arm  = arm;
+            st.block_left = SPEC_LEN_BLOCK;
+        }
+        st.block_left--;
+        return st.block_arm;
+    }
+
+    // a pass's outcome: the acceptance of its positions and the time since the slot's previous pass
+    static void note_spec_len(server_slot & slot, size_t n_accepted) {
+        auto & st = slot.spec_len;
+        const int arm = slot.spec_len_arm;
+        const int64_t t = ggml_time_us();
+        if (arm < 0) {
+            slot.spec_len_t = 0;
+            return;
+        }
+        const auto mean = [](double & m, double x, int & n, int window) {
+            n++;
+            m += (x - m) / std::min(n, window);
+        };
+        mean(st.acc1, n_accepted >= 1 ? 1.0 : 0.0, st.n_acc, 128);
+        st.n_acc--; // counted once for the pass, below
+        mean(st.acc2, n_accepted >= 2 ? 1.0 : 0.0, st.n_acc, 128);
+        if (arm == 1 && n_accepted >= 2) {
+            mean(st.acc3, n_accepted >= 3 ? 1.0 : 0.0, st.n_acc3, 64);
+        }
+        if (st.block_untimed > 0) {
+            st.block_untimed--;           // the passes right after a switch pay for the other shape's graph
+        } else if (slot.spec_len_t > 0) {
+            const double ms = (t - slot.spec_len_t) / 1e3;
+            if (ms < 1000.0) {
+                mean(st.ms[arm], ms, st.n_ms[arm], 64);
+            }
+        }
+        slot.spec_len_t = t;
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -1993,6 +3638,8 @@ private:
             }
         }
 
+        splice_own_tokens(slot, task);
+
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
@@ -2049,6 +3696,32 @@ private:
                     ? std::random_device{}()
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
+            }
+
+            // strixllama: speculative sampling, with a sampler whose distribution it can compute (temperature above 0,
+            // no mirostat, the chain ending in dist); greedy decoding keeps the exact match
+            {
+                static const bool on = !getenv("STRIX_SPEC_SAMPLING") || atoi(getenv("STRIX_SPEC_SAMPLING")) != 0;
+                static const float qscale = getenv("STRIX_SPEC_QSCALE") ? (float) atof(getenv("STRIX_SPEC_QSCALE")) : 1.0f;
+
+                slot.spec_sampling = on && spec && common_speculative_get_synth_probs(spec.get()).empty() &&
+                    common_sampler_spec_supported(slot.smpl.get());
+                SLT_DBG(slot, "speculative sampling %s (chain: %s)\n", slot.spec_sampling ? "on" : "off",
+                        common_sampler_print(slot.smpl.get()).c_str());
+                if (slot.spec_sampling) {
+                    const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                        ? std::random_device{}()
+                        : task.params.sampling.seed;
+                    slot.spec_draft_rng.seed(seed ^ 0x9e3779b9u);
+                    slot.spec_verify_rng.seed(seed ^ 0x85ebca6bu);
+
+                    const auto & sp = task.params.sampling;
+                    slot.spec_sample.temp   = sp.temp;
+                    slot.spec_sample.top_k  = sp.top_k;
+                    slot.spec_sample.top_p  = sp.top_p;
+                    slot.spec_sample.min_p  = sp.min_p;
+                    slot.spec_sample.qscale = qscale;
+                }
             }
         } else {
             slot.smpl.reset();
@@ -2220,7 +3893,8 @@ private:
         return slot.has_next_token; // continue
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx,
+                              const std::vector<float> * logits = nullptr) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -2252,7 +3926,8 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = logits ? get_token_probabilities(logits->data(), (int) logits->size(), n_probs_request)
+                                                       : get_token_probabilities(ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -2671,36 +4346,253 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const int id_task = slot.task->id;
+    // strixllama: how far a turn start must be from the last checkpoint to get one of its own. At least
+    // --checkpoint-min-step, and a quarter of the way to the end of the prompt: dense near the end, where edits and
+    // regenerations land, sparse far back (a 100K prompt of short turns gets ~10)
+    int64_t anchor_spacing(int64_t pos, int64_t n_prompt) const {
+        return std::max<int64_t>(params_base.checkpoint_min_step, (n_prompt - pos) / 4);
+    }
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
-                it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+    // strixllama: a prompt is cut only where a real turn begins - its last user message, when no checkpoint stands there
+    // yet (an edit of the message forks there). What comes before is one piece of context: its turn starts used to be
+    // anchors with a batch cut at each (the first user message, then the spaced ones), ~11 short ubatches on a 156K
+    // conversation read fresh, 3% of its prefill. Checkpoints there now come where a batch ends anyway, spaced as the
+    // anchors were, for an edit further back or a conversation forking inside the prefix. STRIX_CKPT_ANCHORS=1 brings
+    // the cuts back (0.3.2-0.4.7)
+    static bool ckpt_anchors() {
+        static const bool on = getenv("STRIX_CKPT_ANCHORS") && atoi(getenv("STRIX_CKPT_ANCHORS")) != 0;
+        return on;
+    }
 
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
+    // strixllama: checkpoints at an answer's edges instead of prompt batches cut short near their end (STRIX_CKPT_EDGES=0:
+    // the cuts at the end offsets and at the last user message, as up to 0.3.1). A regenerate, a client that drops the
+    // reasoning or re-renders a tool call, an answer cut by Stop: the next prompt forks at or inside the last answer,
+    // and the state where it started - the prompt's end, taken as the first token is sampled - serves them all. An edit
+    // of the new message forks where the answer before it ended: the slot's state as the continuing request arrives.
+    // Both are taken where the state already stands, so neither adds a pass.
+    static bool ckpt_edges() {
+        static const bool on = !getenv("STRIX_CKPT_EDGES") || atoi(getenv("STRIX_CKPT_EDGES")) != 0;
+        return on;
+    }
+
+    bool ckpt_wanted(const server_slot & slot) const {
+        return ckpt_edges() && params_base.n_ctx_checkpoints > 0 && slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0) &&
+            !slot.prompt.tokens.empty() && slot.prompt.tokens[slot.prompt.tokens.size() - 1] != LLAMA_TOKEN_NULL;
+    }
+
+    // strixllama: the tokens end in "<think>\n" - a thinking prompt. A client that drops the reasoning sends that answer
+    // back as "<think>\n\n</think>...", and "\n\n" is a single token, so the next prompt forks one token before this one
+    // ends: the checkpoint where the answer starts is taken there, one token early, by processing the last token alone.
+    // A regenerate then processes that token again for its logits.
+    bool think_tail(const server_tokens & toks, int64_t n) const {
+        if (!ckpt_edges() || n < 2) {
+            return false;
+        }
+        const llama_token last = toks[n - 1];
+        const llama_token prev = toks[n - 2];
+        return last != LLAMA_TOKEN_NULL && prev != LLAMA_TOKEN_NULL &&
+            common_token_to_piece(ctx_tgt, last, true) == "\n" && common_token_to_piece(ctx_tgt, prev, true) == "<think>";
+    }
+
+    // a checkpoint within `d` tokens before `pos`
+    static bool has_ckpt_near(const server_slot & slot, int64_t pos, int64_t d) {
+        for (const auto & c : slot.prompt.checkpoints) {
+            if (c.n_tokens <= pos && c.n_tokens >= pos - d) {
+                return true;
             }
+        }
+        return false;
+    }
 
-            last = it->n_tokens;
-            ++it;
+    // a checkpoint of the slot's state as it stands, whose memory must end where its tokens do; a failure costs a replay
+    // later, not the request
+    bool checkpoint_here(server_slot & slot) {
+        auto * mem = llama_get_memory(ctx_tgt);
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem, slot.id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot.id);
+        if (pos_min < 0 || pos_max + 1 != slot.prompt.tokens.pos_next()) {
+            return false;
+        }
+        try {
+            create_checkpoint(slot, 0, pos_min, pos_max);
+        } catch (const std::exception & e) {
+            SLT_WRN(slot, "no checkpoint at %d tokens: %s\n", slot.prompt.n_tokens(), e.what());
+            return false;
+        }
+        return true;
+    }
+
+    // strixllama: a regenerate restored from the checkpoint where the answer started: its first token is sampled from the
+    // logits kept there, as post_decode samples a finished prompt's
+    void sample_regenerated(server_slot & slot, const std::vector<float> & logits) {
+        slot.stats.n_gen = 0;
+        slot.i_batch     = -1;
+        slot.init_sampler();
+
+        slot.state        = SLOT_STATE_GENERATING;
+        slot.n_prompt_end = slot.prompt.n_tokens();
+
+        if (slot.can_speculate()) {
+            common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample_logits(slot.smpl.get(), logits.data(), (int) logits.size());
+        }
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        common_sampler_accept(slot.smpl.get(), id, true);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+        slot.stats.update_prompt_last();
+        slot.t_print_last = t_now;
+        slot.n_gen_last = 0;
+        slot.stats.update_gen_last();
+
+        const bool special = params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(id) != slot.task->params.sampling.preserved_tokens.end();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, special);
+        result.prob         = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, -1, &logits);
+        }
+
+        SLT_INF(slot, "regenerate: the answer is sampled again where it started, %d tokens, nothing processed\n", slot.prompt.n_tokens());
+
+        if (!process_token(result, slot)) {
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+            return;
+        }
+
+        slot.print_timings_tg();
+    }
+
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        strixllama_fault("ckpt");
+        const int id_task = slot.task->id;
+
+        // strixllama: which checkpoint goes when the list is full. The earliest stays: it is where the system prompt
+        // ends (the first user message), which every conversation that starts with it comes back to. Of the others,
+        // this task's stay if they can, and the one to go is the one whose loss costs least: a rewind into the
+        // stretch it starts replays from the checkpoint before it instead, and rewinds land near the end more often
+        // than far back - so its value is (gap before) x (gap after) / (distance from the end). Upstream erased
+        // every other task's checkpoint within min-step of the previous one, which left the first and this task's
+        // only, and a second conversation with the same 10K system prompt went back to the first checkpoint
+        auto & ckpts = slot.prompt.checkpoints;
+        // strixllama: nor does the one where this task's last user message starts, which an edit of the message forks
+        // from: next to the prompt's end, whose checkpoint is taken as the first token is sampled, it was the cheapest
+        // to lose by that measure and went first on any prompt long enough to fill the list (here and for the budget)
+        const int64_t n_last_user = slot.task->params.message_spans.last_user_message_pos();
+        auto last_user_ckpt = [&](const common_prompt_checkpoint & c) {
+            return n_last_user >= 0 && c.n_tokens <= n_last_user && c.n_tokens >= n_last_user - 16;
+        };
+        while (!ckpts.empty() && ckpts.size() >= (size_t) params_base.n_ctx_checkpoints) {
+            ckpts.sort([](const common_prompt_checkpoint & a, const common_prompt_checkpoint & b) {
+                return a.n_tokens < b.n_tokens;
+            });
+            std::vector<std::list<common_prompt_checkpoint>::iterator> at;
+            for (auto it = ckpts.begin(); it != ckpts.end(); ++it) {
+                at.push_back(it);
+            }
+            const int64_t n_end = slot.prompt.n_tokens();
+            size_t victim = at.size();
+            for (int pass = 0; pass < 2 && victim == at.size(); ++pass) {
+                double v_min = 0.0;
+                for (size_t i = 1; i < at.size(); ++i) {
+                    if (pass == 0 && at[i]->id_task == id_task) {
+                        continue;
+                    }
+                    if (last_user_ckpt(*at[i])) {
+                        continue;
+                    }
+                    const int64_t n_i  = at[i]->n_tokens;
+                    const int64_t prev = at[i - 1]->n_tokens;
+                    const int64_t next = i + 1 < at.size() ? at[i + 1]->n_tokens : std::max<int64_t>(n_end, n_i);
+                    const double v = double(n_i - prev + 1) * double(next - n_i + 1) / double(std::max<int64_t>(n_end - n_i, 0) + 4096);
+                    if (victim == at.size() || v < v_min) {
+                        v_min  = v;
+                        victim = i;
+                    }
+                }
+            }
+            if (victim == at.size()) {
+                victim = 0;                            // a list of one
+            }
+            SLT_INF(slot, "erasing context checkpoint at n_tokens = %" PRId64 " (%zu of %zu, size = %.3f MiB)\n",
+                    at[victim]->n_tokens, victim + 1, at.size(), (float) at[victim]->size() / 1024 / 1024);
+            ckpts.erase(at[victim]);
+        }
+
+        // strixllama: the checkpoints of every slot share one budget in RAM (STRIX_CKPT_BUDGET, 24 by default, ~2.7 GB at
+        // ~113 MiB each; 0: only each slot's n_ctx_checkpoints). Eight conversations of three turns held 6.5 GB of them, and
+        // more with every turn. Over the budget, the slot holding the most in RAM (of equals the least recently used) gives
+        // one up: its least valuable by the measure above, never its first (the end of the system prompt), this task's last.
+        // So one busy conversation still keeps n_ctx_checkpoints, and eight keep three each. Checkpoints the disk tier holds
+        // for an idle slot (no bytes here) do not count.
+        {
+            static const int budget = getenv("STRIX_CKPT_BUDGET") ? atoi(getenv("STRIX_CKPT_BUDGET")) : 24;
+            while (budget > 0) {
+                int           total  = 0;
+                server_slot * most   = nullptr;
+                size_t        most_n = 0;
+                for (auto & s : slots) {
+                    size_t n = 0;
+                    for (const auto & c : s.prompt.checkpoints) {
+                        n += !c.data_tgt.empty();
+                    }
+                    total += (int) n;
+                    if (n >= 2 && (n > most_n || (n == most_n && most != nullptr && s.t_last_used < most->t_last_used))) {
+                        most   = &s;
+                        most_n = n;
+                    }
+                }
+                if (total + 1 <= budget || most == nullptr) {
+                    break;
+                }
+                auto & cl = most->prompt.checkpoints;
+                cl.sort([](const common_prompt_checkpoint & a, const common_prompt_checkpoint & b) {
+                    return a.n_tokens < b.n_tokens;
+                });
+                std::vector<std::list<common_prompt_checkpoint>::iterator> at;
+                for (auto it = cl.begin(); it != cl.end(); ++it) {
+                    at.push_back(it);
+                }
+                const int64_t n_end  = most->prompt.n_tokens();
+                size_t        victim = at.size();
+                for (int pass = 0; pass < 2 && victim == at.size(); ++pass) {
+                    double v_min = 0.0;
+                    for (size_t i = 1; i < at.size(); ++i) {
+                        if (at[i]->data_tgt.empty() || (pass == 0 && most == &slot && at[i]->id_task == id_task) ||
+                                (most == &slot && last_user_ckpt(*at[i]))) {
+                            continue;
+                        }
+                        const int64_t n_i  = at[i]->n_tokens;
+                        const int64_t prev = at[i - 1]->n_tokens;
+                        const int64_t next = i + 1 < at.size() ? at[i + 1]->n_tokens : std::max<int64_t>(n_end, n_i);
+                        const double v = double(n_i - prev + 1) * double(next - n_i + 1) / double(std::max<int64_t>(n_end - n_i, 0) + 4096);
+                        if (victim == at.size() || v < v_min) {
+                            v_min  = v;
+                            victim = i;
+                        }
+                    }
+                }
+                if (victim == at.size()) {
+                    break;
+                }
+                SLT_INF(*most, "erasing context checkpoint at n_tokens = %" PRId64 " for the RAM budget (%d in RAM across the slots, budget %d)\n",
+                        at[victim]->n_tokens, total, budget);
+                cl.erase(at[victim]);
+            }
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2725,8 +4617,14 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_ck0 = ggml_time_us();
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_ck1 = ggml_time_us();
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (getenv("STRIX_CKPT_TIMING")) {
+            SLT_INF(slot, "checkpoint at %" PRId64 ": target %.1f ms (%.1f MiB), draft %.1f ms (%.1f MiB)\n", cur.n_tokens,
+                    (t_ck1 - t_ck0) / 1000.0, cur.data_tgt.size() / 1048576.0, (ggml_time_us() - t_ck1) / 1000.0, cur.data_dft.size() / 1048576.0);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2974,6 +4872,16 @@ private:
 
                     const int id_task = task.id;
 
+                    // strixllama: whether it waits for room in the pool is decided afresh below (pool_guard_on)
+                    task.wait_pool = false;
+
+                    // strixllama: another slot is computing this prompt's prefix right now: wait for it
+                    if (wait_for_prefix(task)) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    pool_deferred = false;
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -2981,6 +4889,16 @@ private:
                     //
 
                     if (slot == nullptr) {
+                        // strixllama: no room in the unified pool for it yet: it waits, holding no slot, until there is
+                        // (the deferred tasks in update_slots)
+                        if (pool_deferred) {
+                            task.wait_pool = true;
+                            if (task.wait_pool_t0 == 0) {
+                                task.wait_pool_t0 = ggml_time_us();
+                                SRV_INF("task %d waits for room in the KV pool: %zu prompt tokens, %u cells, %" PRId64 " free\n",
+                                        id_task, task.tokens.size(), llama_n_ctx(ctx_tgt), pool_free());
+                            }
+                        }
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
@@ -2992,6 +4910,10 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    if (task.wait_pool_t0 != 0) {
+                        SRV_INF("task %d starts after %.1f s waiting for room in the KV pool\n", id_task, (ggml_time_us() - task.wait_pool_t0) / 1e6);
                     }
 
                     if (task.is_parent()) {
@@ -3077,11 +4999,7 @@ private:
                             if (task.params.control_action == SERVER_CONTROL_ACTION_AUDIO_APPEND) {
                                 mtmd_audio_stream_push(stream, task.params.control_audio.data(), task.params.control_audio.size());
                             } else {
-                                const int32_t ret = mtmd_audio_stream_flush(stream, task.params.control_action == SERVER_CONTROL_ACTION_AUDIO_END);
-                                // a non-final commit completes its item once the rows of its audio are decoded
-                                if (ret == 0 && task.params.control_action == SERVER_CONTROL_ACTION_AUDIO_COMMIT) {
-                                    slot->audio_commit_rows.push_back(mtmd_audio_stream_get_n_rows_flushed(stream));
-                                }
+                                mtmd_audio_stream_flush(stream, task.params.control_action == SERVER_CONTROL_ACTION_AUDIO_END);
                             }
                             slot->audio_wait = false;
                             res->success = true;
@@ -3138,6 +5056,7 @@ private:
                     res->id           = task.id;
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
+                    res->n_tasks_deferred = (int) queue_tasks.queue_tasks_deferred_size();
 
                     queue_results.send(std::move(res));
                 } break;
@@ -3249,6 +5168,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        common_speculative_set_state(spec.get(), slot->id, {});   // a slot file has no drafter state
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3298,6 +5218,36 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_DISK_PERSIST:
+                {
+                    // strixllama: the server is about to be stopped, and every conversation in a slot leaves memory
+                    // with it - each goes to the disk tier as it would on leaving its slot (its last run, the
+                    // recurrent state at its end, its last prompt's checkpoints), and the answer waits for the
+                    // writer. A slot still generating is left alone: its request is about to be cut off anyway.
+                    auto res = std::make_unique<server_task_result_control>();
+                    res->id = task.id;
+                    const int64_t t0 = ggml_time_us();
+                    int n_saved = 0;
+                    int64_t n_tokens = 0;
+                    if (prompt_cache && prompt_cache->has_disk()) {
+                        for (auto & slot : slots) {
+                            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                                continue;
+                            }
+                            if (slot.prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ true)) {
+                                n_saved++;
+                                n_tokens += slot.prompt.n_tokens();
+                            }
+                        }
+                        res->success = prompt_cache->disk_drain(120000);
+                    } else {
+                        res->success = true;
+                    }
+                    res->message = string_format("%d conversations, %lld tokens, %.0f ms%s", n_saved, (long long) n_tokens,
+                                                 (ggml_time_us() - t0) / 1000.0, res->success ? "" : "; the writer did not finish in time");
+                    SRV_INF("persist: %s\n", res->message.c_str());
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -3342,14 +5292,31 @@ private:
         return true;
     }
 
+    // strixllama: a slot that threw part way through its turn - adding to the batch, or changing its cache; an
+    // exhausted commit limit throws std::bad_alloc from anywhere that allocates. Its tokens no longer say what its
+    // memory holds, and a conversation that went on from there fed the recurrent state positions it had seen already,
+    // or skipped some (GitHub issue #1); with one slot, its tokens left in a batch no slot owned aborted the server.
+    // Its tokens leave the batch if that is still being built, and its conversation leaves the cache: the next
+    // request for it is processed again, or read back from the disk tier.
+    void slot_failed(server_slot & slot, const std::string & what) {
+        SLT_ERR(slot, "got exception: %s\n", what.c_str());
+        send_error(slot, std::string("got exception: ") + what, ERROR_TYPE_SERVER);
+        slot.release();
+        if (!batch.decoding) {
+            batch.drop_slot(slot.id);
+            if (batch.slot_batched == &slot) {
+                batch.slot_batched = batch.size() > 0 ? get_slot_by_id(batch.tokens[0].id_slot) : nullptr;
+            }
+        }
+        slot.prompt_clear();
+    }
+
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
                 callback(slot);
             } catch (const std::exception & e) {
-                SLT_ERR(slot, "got exception: %s\n", e.what());
-                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
-                slot.release();
+                slot_failed(slot, e.what());
             }
         }
     }
@@ -3359,18 +5326,19 @@ private:
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
-                SLT_ERR(*slot, "got exception: %s\n", e.what());
-                send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
-                slot->release();
+                slot_failed(*slot, e.what());
             }
         }
     }
 
+    // strixllama: as for one slot that failed, every slot that was in the batch loses its conversation - how much of
+    // the batch reached its memory is not known (the decode error path below does the same)
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+                slot.prompt_clear();
             }
         }
     }
@@ -3412,22 +5380,6 @@ private:
             return true; // rows from a previous step, not decoded yet
         }
 
-        // every produced row is decoded and its delta queued, the commits ending there are complete
-        const int64_t n_rows = mtmd_audio_stream_get_n_rows(slot.audio_stream.get());
-        while (!slot.audio_commit_rows.empty() && slot.audio_commit_rows.front() <= n_rows) {
-            slot.audio_commit_rows.pop_front();
-            auto res = std::make_unique<server_task_result_cmpl_partial>();
-            res->id                   = slot.task->id;
-            res->index                = slot.task->index;
-            res->n_decoded            = slot.stats.n_gen;
-            res->n_prompt_tokens      = slot.task->n_tokens();
-            res->res_type             = slot.task->params.res_type;
-            res->oaicompat_model      = slot.task->params.oaicompat_model;
-            res->oaicompat_cmpl_id    = slot.task->params.oaicompat_cmpl_id;
-            res->audio_commit_drained = true;
-            queue_results.send(std::move(res));
-        }
-
         const int32_t n = mtmd_audio_stream_step(slot.audio_stream.get(), slot.sampled);
         if (n > 0) {
             const float * rows = mtmd_audio_stream_get_output_embd(slot.audio_stream.get());
@@ -3455,6 +5407,11 @@ private:
     }
 
     void update_slots() {
+        if (strixllama_spec_timing::enabled()) {
+            const int64_t now = ggml_time_us();
+            if (g_spec_timing.t_exit) { g_spec_timing.gap += now - g_spec_timing.t_exit; }
+            g_spec_timing.t_enter = now;
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3467,6 +5424,40 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // strixllama: disk tier version 3 - a conversation's full runs go to the store as it grows, each written once;
+        // gathering one takes ~15 ms, once every disk_run positions
+        if (prompt_cache && prompt_cache->has_disk()) {
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    slot.persist_runs(*prompt_cache, /* leaving = */ false, /* wait = */ false);
+                }
+            }
+        }
+
+        // strixllama: prompts waiting for another slot's prefix (wait_for_prefix) go back to the queue once that slot
+        // is past it, has left that prompt, or two minutes went by; prompts waiting for room in the pool once they fit
+        // (pool_guard_on) - one that has waited a minute holds back those behind it, so it is not passed for ever
+        {
+            const int64_t now = ggml_time_us();
+            bool pool_blocked = false;
+            queue_tasks.pop_deferred_if([&](const server_task & t) {
+                if (t.wait_pool) {
+                    if (pool_blocked) {
+                        return false;
+                    }
+                    const bool fits = !pool_any_busy() || pool_fits((int64_t) t.tokens.size() + pool_answer_room(task_n_predict(t)));
+                    pool_blocked = !fits && now - t.wait_pool_t0 > 60 * 1000 * 1000;
+                    return fits;
+                }
+                if (t.wait_slot < 0 || t.wait_slot >= (int) slots.size()) {
+                    return false;
+                }
+                const auto & s = slots[t.wait_slot];
+                return (s.state != SLOT_STATE_STARTED && s.state != SLOT_STATE_PROCESSING_PROMPT) ||
+                       (int64_t) s.prompt.n_tokens() > t.wait_n || now - t.wait_t0 > 120 * 1000 * 1000;
+            });
+        }
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
@@ -3484,6 +5475,10 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+
+                // strixllama: nothing is running, so this is when conversations go to disk - in blocks, once one
+                // has grown by disk_block tokens since it was last written
+                persist_idle_slots();
 
                 return; // skip further processing
 
@@ -3536,8 +5531,13 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        if (spec && spec_adapt_on()) {
+            spec_adapt.t_pure = spec_adapt.t_gen_rows > 0 && batch.size() == spec_adapt.t_gen_rows;
+        }
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+        batch.decoding = true;
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3568,13 +5568,19 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                const int64_t t_pd0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
                 post_decode(n_tokens, off);
+                if (t_pd0) { g_spec_timing.post += ggml_time_us() - t_pd0; }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
+        if (spec && spec_adapt_on()) {
+            spec_adapt_done();
+        }
+        if (strixllama_spec_timing::enabled()) { g_spec_timing.t_exit = ggml_time_us(); }
     }
 
     void process_tts_slots() {
@@ -3653,6 +5659,10 @@ private:
     }
 
     void pre_decode() {
+        if (spec && spec_adapt_on()) {
+            spec_adapt_tick();
+        }
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3730,10 +5740,74 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // strixllama: a draft pays for itself on one conversation, not on several at once. Every drafted token is
+        // verified, and in this mixture of experts each verified token reads the weights of ~10 more experts;
+        // several conversations already share the trunk's cost, so their drafts add verification they cannot
+        // win back. STRIX_SPEC_DRAFT_BY_SLOTS caps the draft by how many slots generate this step: "3,2,2,0"
+        // drafts 3 tokens for one, 2 for two or three and none from four on.
+        // A request that samples (speculative sampling, see spec_sampling) has its drafts accepted less often than a
+        // greedy one - at temperature 0.7 on prose ~67% at the first position against ~86% - so a draft position pays
+        // for itself less often: STRIX_SPEC_DRAFT_BY_SLOTS_SAMPLED is its table, also with one slot (unset: as greedy).
+        int n_draft_cap         = INT_MAX;
+        int n_draft_cap_sampled = INT_MAX;
+        int n_gen               = 0;
+        if (spec) {
+            auto table = [](const char * name) {
+                std::vector<int> v;
+                const char * e = getenv(name);
+                for (const char * p = e; p && *p; ) {
+                    v.push_back(std::max(0, atoi(p)));
+                    p = strchr(p, ',');
+                    p = p ? p + 1 : nullptr;
+                }
+                return v;
+            };
+            static const std::vector<int> by_slots         = table("STRIX_SPEC_DRAFT_BY_SLOTS");
+            static const std::vector<int> by_slots_sampled = table("STRIX_SPEC_DRAFT_BY_SLOTS_SAMPLED");
+            for (const auto & s : slots) {
+                n_gen += s.state == SLOT_STATE_GENERATING;
+            }
+            if (n_gen > 0 && !by_slots.empty()) {
+                n_draft_cap = by_slots[std::min<size_t>(n_gen, by_slots.size()) - 1];
+            }
+            n_draft_cap_sampled = n_gen > 0 && !by_slots_sampled.empty()
+                ? by_slots_sampled[std::min<size_t>(n_gen, by_slots_sampled.size()) - 1]
+                : n_draft_cap;
+            const int user_cap = g_strix_draft_cap.load(std::memory_order_relaxed);
+            n_draft_cap         = std::min(n_draft_cap, user_cap);
+            n_draft_cap_sampled = std::min(n_draft_cap_sampled, user_cap);
+            if (n_gen >= 2 && spec_adapt_on()) {
+                const int d_max = std::min(common_speculative_n_max(spec.get()), user_cap);
+                n_draft_cap = n_draft_cap_sampled = spec_adapt_choose(n_gen, d_max, std::min(n_draft_cap, d_max));
+            }
+        }
+        const int n_draft_limit = spec ? std::min(common_speculative_n_max(spec.get()), g_strix_draft_cap.load(std::memory_order_relaxed)) : 0;
+
+        // strixllama: the cells this step's answers take so far (see pool_guard_on)
+        int64_t n_pool_step = 0;
+        const int64_t n_spec_max = spec ? std::min<int64_t>(n_draft_limit, std::max(n_draft_cap, n_draft_cap_sampled + 1)) : 0;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS) {
                 return;
+            }
+
+            // strixllama: no cells for this answer's next tokens: idle conversations go to disk, and failing that it
+            // waits a step for another conversation to finish (see pool_guard_on)
+            if (pool_guard_on() && params_base.kv_unified) {
+                const int64_t need = 1 + std::max<int64_t>(n_spec_max, (int64_t) slot.spec_draft.size());
+                while (pool_free() - n_pool_step < need + POOL_STEP_MARGIN && try_clear_idle_slots()) {
+                }
+                if (pool_free() - n_pool_step < need + POOL_STEP_MARGIN) {
+                    if (!slot.pool_paused) {
+                        SLT_WRN(slot, "the KV pool (%u cells) is full: the answer waits for another conversation to finish\n", llama_n_ctx(ctx_tgt));
+                    }
+                    slot.pool_paused = true;
+                    return;
+                }
+                slot.pool_paused = false;
+                n_pool_step += need;
             }
 
             if (slot.audio_stream && !slot_audio_step(slot)) {
@@ -3755,7 +5829,15 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int cap = slot.spec_sampling ? n_draft_cap_sampled : n_draft_cap;
+                slot.spec_len_arm = -1;
+                if (slot.spec_sampling && n_gen == 1 && cap >= 2 && cap < n_draft_limit && cap < slot.get_n_draft_max() &&
+                        spec_len_on()) {
+                    slot.spec_len_arm = choose_spec_len(slot);
+                    cap += slot.spec_len_arm;
+                    slot.spec_len_used[slot.spec_len_arm]++;
+                }
+                const int n_draft_max = std::min(slot.get_n_draft_max(), cap);
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3791,10 +5873,17 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
-                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .result_q = */ spec_reject && !slot.spec_sampling ? &slot.spec_draft_q : nullptr,   // strixllama: ours records q itself
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
                         };
+
+                        slot.spec_draft_q.clear();
+                        if (slot.spec_sampling) {
+                            slot.spec_sample.rng = &slot.spec_draft_rng;
+                            slot.spec_sample.q   = &slot.spec_draft_q;
+                            common_speculative_get_draft_params(spec.get(), slot.id).sample = &slot.spec_sample;
+                        }
 
                         drafting.push_back(&slot);
                     }
@@ -3802,11 +5891,42 @@ private:
             }
         });
 
+        // strixllama: STRIX_SPEC_TIMING=1 without drafts (MTP off) - the step begins here all the same
+        if (drafting.empty() && strixllama_spec_timing::enabled()) {
+            g_spec_timing.pre += ggml_time_us() - g_spec_timing.t_enter;
+            g_spec_timing.begin_pass();
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const bool st = strixllama_spec_timing::enabled();
+            if (st) { g_spec_timing.pre += ggml_time_us() - g_spec_timing.t_enter; g_spec_timing.begin_pass(); }
+            const int64_t t0 = st ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (st) { g_spec_timing.draft += ggml_time_us() - t0; }
+        }
+
+        // strixllama: the drafter makes the drafts of one step the same length (STRIX_SPEC_EVEN_DRAFTS); a generating slot
+        // that drafted nothing this step (its cap ran out, it cannot speculate) would still make the verify batch
+        // uneven, and the hybrid memory would run it as several passes of the whole model. Every draft is cut to the
+        // shortest, unless a slot replays tokens it has already accepted.
+        if (spec && generating.size() > 1) {
+            static const bool even = !getenv("STRIX_SPEC_EVEN_DRAFTS") || atoi(getenv("STRIX_SPEC_EVEN_DRAFTS")) != 0;
+            bool replay = false;
+            size_t len = SIZE_MAX;
+            for (const server_slot * s : generating) {
+                replay = replay || s->spec_is_replay;
+                len = std::min(len, s->spec_draft.size());
+            }
+            if (even && !replay) {
+                for (server_slot * s : generating) {
+                    if (s->spec_draft.size() > len) {
+                        s->spec_draft.resize(len);
+                    }
+                }
+            }
         }
 
         // make checkpoints if needed
@@ -3841,6 +5961,8 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.data_spec.clear();
+                    common_speculative_get_state(spec.get(), slot.id, ckpt.data_spec);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3861,10 +5983,31 @@ private:
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        if (spec && spec_adapt_on()) {
+            spec_adapt.t_gen_rows = batch.size();
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+        // strixllama: while conversations generate, a step takes at most STRIX_PREFILL_BUDGET prompt tokens (default
+        // 2048, 0: up to n_batch), so their next tokens wait for that much of another conversation's prefill rather
+        // than for n_batch tokens of it; the ragged ubatch runs their tokens in the same pass. Six agents on eight
+        // slots (tmp/ragged/agent_sim.py): no stall over 2.8 s instead of up to 4.9 s, time to first token as without
+        // it; 1024 kept every stall under 2 s but cost 20-30% of the time to first token
+        int32_t n_batch_prompt = n_batch;
+        {
+            static const int32_t budget = [] {
+                const char * e = getenv("STRIX_PREFILL_BUDGET");
+                return e ? atoi(e) : 2048;
+            }();
+            if (budget > 0 && batch.size() > 0) {
+                n_batch_prompt = std::min<int32_t>(n_batch, batch.size() + budget);
+            }
+        }
+        // strixllama: the prompt tokens a step takes, which the next step's per-layer-embedding pregather expects
+        const int32_t n_prompt_step = std::max<int32_t>(1, n_batch_prompt - batch.size());
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3873,8 +6016,22 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+            // strixllama: prompts in the order their requests arrived (task ids grow with arrival), not by slot number:
+            // the request that came first gets its tokens into a step first (STRIX_PROMPT_ORDER=slot: by slot)
+            static const bool by_arrival = !getenv("STRIX_PROMPT_ORDER") || std::string(getenv("STRIX_PROMPT_ORDER")) != "slot";
+            std::vector<server_slot *> prompt_order;
+            prompt_order.reserve(slots.size());
+            for (auto & s : slots) {
+                prompt_order.push_back(&s);
+            }
+            if (by_arrival) {
+                std::stable_sort(prompt_order.begin(), prompt_order.end(), [](const server_slot * a, const server_slot * b) {
+                    return (a->task ? a->task->id : INT_MAX) < (b->task ? b->task->id : INT_MAX);
+                });
+            }
+
+            iterate(prompt_order, [&](server_slot & slot) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3905,6 +6062,9 @@ private:
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
 
+                    // strixllama: a regenerate restored where its answer started: the logits it is sampled from
+                    std::vector<float> regen_logits;
+
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
@@ -3926,6 +6086,26 @@ private:
                                 SLT_DBG(slot, "prompt token %3d: %6d '%s'\n", i, input_tokens[i], common_token_to_piece(ctx_tgt, input_tokens[i]).c_str());
                             }
                         }*/
+
+                        // STRIX_STATE_HASH: what the slot holds as a task starts - the recurrent part and the whole
+                        // state - to tell a restored conversation from a resident one (debugging only)
+                        if (getenv("STRIX_STATE_HASH") && slot.prompt.n_tokens() > 0) {
+                            for (const llama_state_seq_flags fl : { (llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, (llama_state_seq_flags) 0 }) {
+                                std::vector<uint8_t> st(llama_state_seq_get_size_ext(ctx_tgt, slot.id, fl));
+                                llama_state_seq_get_data_ext(ctx_tgt, st.data(), st.size(), slot.id, fl);
+                                SLT_INF(slot, "STATE_HASH %s: %zu bytes, %016llx (%d tokens)\n", fl ? "recurrent" : "whole", st.size(),
+                                        (unsigned long long) XXH3_64bits(st.data(), st.size()), slot.prompt.n_tokens());
+                                // DEV: STRIX_STATE_DUMP=<dir> writes the whole state as the task starts, to diff two runs
+                                if (!fl && getenv("STRIX_STATE_DUMP")) {
+                                    const std::string fn = std::string(getenv("STRIX_STATE_DUMP")) + "/state_" +
+                                        std::to_string(slot.prompt.n_tokens()) + "_" + std::to_string(slot.task->id) + ".bin";
+                                    if (FILE * f = fopen(fn.c_str(), "wb")) {
+                                        fwrite(st.data(), 1, st.size(), f);
+                                        fclose(f);
+                                    }
+                                }
+                            }
+                        }
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
@@ -4077,6 +6257,24 @@ private:
                                 n_past = 0;
                             }
 
+                            // strixllama: how the client treats an answer. A request that goes past the last prompt's end and
+                            // keeps less than the answer re-rendered it (dropped the reasoning, re-serialized a tool call,
+                            // cut it); one that keeps it all continued it as generated; one that forks before the prompt's
+                            // end is another branch - nothing learnt. A regenerate (nothing new) says nothing either
+                            // A conversation loaded back from the store comes only as far as this prompt shares it, so its
+                            // answer is often not in the slot: then the prompt is compared with the answer's first tokens as
+                            // they were generated (tail_known)
+                            if (slot.n_prompt_end > 0 && n_past < slot.task->n_tokens()) {
+                                if (slot.prompt.n_tokens() > slot.n_prompt_end) {
+                                    slot.tail_forks = n_past >= slot.n_prompt_end && n_past < slot.prompt.n_tokens();
+                                } else if (slot.tail_n > 0 && slot.task->tokens.get_text_tokens().size() == slot.task->tokens.size() &&
+                                        (int64_t) slot.task->n_tokens() >= slot.n_prompt_end + slot.tail_n) {
+                                    slot.tail_forks = tail_hash(slot.task->tokens.get_text_tokens(), slot.n_prompt_end, slot.tail_n) != slot.tail_hash_v;
+                                }
+                            }
+                            slot.tail_n      = 0;
+                            slot.tail_hash_v = 0;
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // number of cached tokens shared with the new prompt, before any checkpoint is restored
@@ -4142,26 +6340,60 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                // strixllama: a regenerate - the prompt is the cache's up to where its last answer started,
+                                // and the checkpoint taken there kept the logits the answer's first token came from: the
+                                // state goes back there and the token is sampled from them, nothing is processed
+                                if (ckpt_edges() && !has_new_tokens && pos_min >= pos_min_thold && !slot.task->is_parent() &&
+                                        lora_get_enabled_ids(slot.lora).empty()) {
+                                    for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
+                                        if (it->n_tokens != n_past || it->logits.empty() || it->pos_max + 1 != pos_next) {
+                                            continue;
                                         }
-                                    );
+                                        if (it->data_tgt.empty() && !(prompt_cache && prompt_cache->ckpt_page_in(slot.prompt.tokens, slot.ckpt_paged, *it))) {
+                                            break;
+                                        }
+                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        regen_logits = it->logits;
+                                        break;
+                                    }
+                                }
+
+                                if (regen_logits.empty() && pos_min >= pos_min_thold) {
+                                    // search for a context checkpoint
+                                    auto usable = [&](const auto & cur) {
+                                        // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                        SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                        // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
+                                        if (cur.pos_max > pos_next) {
+                                            return false;
+                                        }
+                                        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                    };
+                                    auto it = std::find_if(slot.prompt.checkpoints.rbegin(), slot.prompt.checkpoints.rend(), usable);
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    // strixllama: an idle slot hands its checkpoints' bytes back to the disk tier; the one
+                                    // a rewind picks is read back now. One that cannot be is dropped and the next older one
+                                    // tried: replaying from an earlier checkpoint still beats processing the whole prompt.
+                                    while (!do_reset && it->data_tgt.empty()) {
+                                        const int64_t t_in = ggml_time_us();
+                                        if (prompt_cache && prompt_cache->ckpt_page_in(slot.prompt.tokens, slot.ckpt_paged, *it)) {
+                                            SLT_INF(slot, "read checkpoint at %" PRId64 " tokens back from the disk tier in %.0f ms\n",
+                                                    it->n_tokens, (ggml_time_us() - t_in) / 1000.0);
+                                            break;
+                                        }
+                                        SLT_WRN(slot, "checkpoint at %" PRId64 " tokens could not be read back from the disk tier, trying an older one\n", it->n_tokens);
+                                        slot.prompt.checkpoints.erase(std::next(it).base());
+                                        it = std::find_if(slot.prompt.checkpoints.rbegin(), slot.prompt.checkpoints.rend(), usable);
+                                        do_reset = it == slot.prompt.checkpoints.rend();
+                                    }
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
+                                        const int64_t t_ld0 = ggml_time_us();
                                         if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
                                             !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                                             if (it->id_task != -1) {
@@ -4170,6 +6402,8 @@ private:
                                             // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
                                             SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
                                             do_reset = true;
+                                        } else if (getenv("STRIX_CKPT_TIMING")) {
+                                            SLT_INF(slot, "checkpoint at %" PRId64 " restored in %.1f ms\n", it->n_tokens, (ggml_time_us() - t_ld0) / 1000.0);
                                         }
                                     }
 
@@ -4205,8 +6439,15 @@ private:
                             }
                         }
 
+                        // strixllama: the request continues the whole cache - the answer before it came back as it was
+                        // generated. The state now, at that answer's end, is where an edit of the new message goes back to
+                        if (regen_logits.empty() && n_past > 0 && n_past == slot.prompt.n_tokens() && n_past < slot.task->n_tokens() &&
+                                ckpt_wanted(slot) && !has_ckpt_near(slot, n_past, 0)) {
+                            checkpoint_here(slot);
+                        }
+
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
+                        if (regen_logits.empty() && n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
@@ -4238,6 +6479,47 @@ private:
                         }
                     }
 
+                    // strixllama: the prompt's next piece only as far as there are cells for it, a few left to each answer
+                    // being generated; an image goes whole. Idle conversations go to disk to make room, and otherwise the
+                    // prompt waits for another conversation to finish (see pool_guard_on)
+                    int32_t n_batch_slot = n_batch_prompt;
+                    if (pool_guard_on() && params_base.kv_unified && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);   // what the cache held past the prompt
+
+                        int64_t n_media = 0;
+                        for (size_t i = slot.prompt.n_tokens(); i < (size_t) slot.task->n_tokens() && input_tokens[i] == LLAMA_TOKEN_NULL; ) {
+                            const size_t n = mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(i).get());
+                            n_media += (int64_t) n;
+                            i += std::max<size_t>(n, 1);
+                        }
+                        const int64_t n_text = std::min<int64_t>(slot.task->n_tokens() - slot.prompt.n_tokens() - n_media, n_batch_prompt - batch.size());
+                        const int64_t n_want = n_media + std::max<int64_t>(n_text, 0);
+                        const int64_t n_min  = n_media + (n_text > 0 ? 1 : 0);
+
+                        auto keep_for_answers = [&]() {
+                            int64_t n = POOL_STEP_MARGIN;
+                            for (const auto & s : slots) {
+                                n += s.state == SLOT_STATE_GENERATING ? POOL_ANSWER_KEEP : 0;
+                            }
+                            return n;
+                        };
+                        int64_t room = pool_free() - keep_for_answers();
+                        if (room < n_want) {
+                            make_room(slot, (size_t) (slot.prompt.n_tokens() + n_want + keep_for_answers()));
+                            room = pool_free() - keep_for_answers();
+                        }
+                        if (room < n_min || room <= 0) {
+                            if (!slot.pool_waiting) {
+                                SLT_WRN(slot, "the KV pool (%u cells) is full: the prompt waits for another conversation to finish (%d of %d tokens in)\n",
+                                        llama_n_ctx(ctx_tgt), slot.prompt.n_tokens(), slot.task->n_tokens());
+                            }
+                            slot.pool_waiting = true;
+                            return;
+                        }
+                        slot.pool_waiting = false;
+                        n_batch_slot = (int32_t) std::min<int64_t>(n_batch_prompt, batch.size() + room - n_media);
+                    }
+
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
@@ -4248,6 +6530,29 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+
+                    // strixllama: the slot's tokens and its memory must agree before anything is added - the memory holds
+                    // positions up to p0 - 1 and the recurrent state is at p0 - 1 (for a hybrid memory the lowest position
+                    // is the recurrent one, the highest the lower of the two). If they do not, going on feeds the
+                    // recurrent state positions it has seen already, or skips some (GitHub issue #1): the conversation
+                    // is processed again from its start instead. Not checked with images in the prompt, whose
+                    // positions run ahead of their cells - but checked with a vision projector loaded and none in it.
+                    if (slot.prompt.tokens.get_text_tokens().size() == slot.prompt.tokens.size()) {
+                        auto * mem_tgt = llama_get_memory(ctx_tgt);
+                        const llama_pos pos_max = llama_memory_seq_pos_max(mem_tgt, slot.id);
+                        const llama_pos pos_min = llama_memory_seq_pos_min(mem_tgt, slot.id);
+                        if (pos_max != p0 - 1 || pos_min > p0 - 1) {
+                            SLT_WRN(slot, "the cache is out of step with its tokens: %d tokens, but the memory holds positions [%d, %d]; "
+                                    "processing the prompt from its start\n", slot.prompt.n_tokens(), pos_min, pos_max);
+                            slot.prompt_clear();
+                        }
+                    }
+
+                    // strixllama: a regenerate restored where its answer started (above): sampled, nothing to process
+                    if (!regen_logits.empty() && slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                        sample_regenerated(slot, regen_logits);
+                        return;
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4350,11 +6655,41 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    // strixllama: anchors (STRIX_CKPT_ANCHORS, see ckpt_anchors), the points a later prompt forks from.
+                    // The first user message is where the system prompt ends, which every conversation that starts with
+                    // it comes back to; the other turn starts get a checkpoint when far enough from the last one, the
+                    // spacing shrinking towards the end of the prompt, where edits and regenerations land (see
+                    // anchor_spacing)
+                    const auto first_user_pos = spans.first_user_message_pos();
+                    const int64_t n_prompt_all = slot.task->n_tokens();
+                    // strixllama: the last user message starts right after the checkpoint where the answer before it
+                    // ended (a continuing request takes one): no cut there (see ckpt_edges)
+                    const bool last_user_covered = ckpt_edges() && last_user_pos >= 0 && has_ckpt_near(slot, last_user_pos, 16);
+                    const bool think_end = think_tail(input_tokens, n_prompt_all);
+                    // the checkpoint n_ubatch before the end is upstream's cover for an edit near the end of a long
+                    // last message; the last message's own start covers it when that is within the same distance
+                    const bool ubatch_offset = !(last_user_pos >= 0 && n_prompt_all - last_user_pos <= 4 + (int64_t) n_ubatch);
+                    // the checkpoint the anchors below are spaced from: the latest, or this batch's own start when that
+                    // gets one - it is made only once the batch is filled, and spacing from the older one cut a short
+                    // batch at the next turn start that then got no checkpoint
+                    const int64_t batch_start = slot.prompt.n_tokens();
+                    int64_t ckpt_ref = slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens;
+                    if (do_checkpoint && batch_start > 0) {
+                        const bool start_anchor = spans.is_turn_start(batch_start) && ((batch_start == last_user_pos && !last_user_covered) ||
+                                (ckpt_anchors() && (batch_start == first_user_pos || ckpt_ref < 0 ||
+                                batch_start >= ckpt_ref + anchor_spacing(batch_start, n_prompt_all))));
+                        const bool start_offset = (!ckpt_edges() && (batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
+                                (ubatch_offset && batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch)))) ||
+                                (think_end && batch_start == n_prompt_all - 1);
+                        if (start_anchor || start_offset) {
+                            ckpt_ref = batch_start;
+                        }
+                    }
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4392,12 +6727,13 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
-                            const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
+                        // break at the last user message (see ckpt_anchors); with the anchors, also at the first one
+                        // and at the other turn starts far enough from the last checkpoint
+                        if (do_checkpoint && spans.is_turn_start(slot.prompt.n_tokens())) {
+                            const int64_t pos = slot.prompt.n_tokens();
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if ((pos == last_user_pos && !last_user_covered) || (ckpt_anchors() && (pos == first_user_pos ||
+                                    ckpt_ref < 0 || pos >= ckpt_ref + anchor_spacing(pos, n_prompt_all)))) {
                                 break;
                             }
                         }
@@ -4407,11 +6743,17 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && think_end && slot.task->n_tokens() == slot.prompt.n_tokens() + 1) {
+                            break;
+                        }
+                        if (do_checkpoint && !ckpt_edges()) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (offset != 4 && !ubatch_offset) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -4424,6 +6766,56 @@ private:
                         }
                     }
 
+                    // strixllama: while this batch is on the GPU, gather what the next one needs from disk - the
+                    // model's per-layer-embedding rows, ~0.2-0.7 s a batch otherwise spent before its compute. The
+                    // n-gram lookups reach back two tokens, so those come along as context. The next chunk is as long
+                    // as this step's: n_batch alone, the prefill budget while others generate (it then follows their
+                    // tokens in the batch, which the reader allows for). Chunks under 4096 tokens used to gather for
+                    // themselves - every 2048-token chunk beside generating conversations, the last chunk of a prompt.
+                    // This chunk's own rows, when the step before did not announce them (a prompt's first chunk): read
+                    // now, on a thread of their own, so the reads overlap the rest of the step's preparation and the
+                    // graph build; the batch's gather waits for them
+                    {
+                        const int64_t cur_end = slot.prompt.n_tokens();
+                        const int64_t cur_beg = cur_end - (int64_t) (batch.size() - n_tokens_prev);
+                        if (cur_end - cur_beg >= 64 && cur_beg != slot.ple_announced) {
+                            const int64_t beg = std::max<int64_t>(0, cur_beg - 2);
+                            std::vector<llama_token> toks;
+                            toks.reserve(cur_end - beg);
+                            bool media = false;
+                            for (int64_t i = beg; i < cur_end && !media; ++i) {
+                                const llama_token t = input_tokens[i];
+                                media = t == LLAMA_TOKEN_NULL;
+                                toks.push_back(t);
+                            }
+                            if (!media) {
+                                llama_strix_pregather_now(ctx_tgt, toks.data(), (int32_t) toks.size(), (int32_t) (cur_beg - beg));
+                            }
+                        }
+                        slot.ple_announced = -1;
+                    }
+                    if (slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        const int64_t nxt = slot.prompt.n_tokens();
+                        const int64_t end = std::min<int64_t>(slot.task->n_tokens(), nxt + n_prompt_step);
+                        const int64_t beg = std::max<int64_t>(0, nxt - 2);
+                        if (end - nxt >= 64) {
+                            std::vector<llama_token> toks;
+                            toks.reserve(end - beg);
+                            bool media = false;
+                            for (int64_t i = beg; i < end && !media; ++i) {
+                                const llama_token t = input_tokens[i];
+                                media = t == LLAMA_TOKEN_NULL;
+                                if (!media) {
+                                    toks.push_back(t);
+                                }
+                            }
+                            if (!media) {                   // a batch with an image in it gathers for itself
+                                llama_strix_prefetch(ctx_tgt, toks.data(), (int32_t) toks.size(), (int32_t) (nxt - beg));
+                                slot.ple_announced = nxt;
+                            }
+                        }
+                    }
+
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
@@ -4431,8 +6823,18 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
+                    const bool is_user_start = spans.is_turn_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    // strixllama: the batch starts at the last user message the loop cut it at, or where the batch
+                    // before it ended, spaced from the last checkpoint as the anchors were (see ckpt_anchors; with them,
+                    // at an anchor), or at one of the offsets before the end
+                    const bool spaced = slot.prompt.checkpoints.empty() ||
+                            n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + anchor_spacing(n_tokens_start, n_prompt_all);
+                    const bool is_anchor = (is_user_start && is_last_user_message && !last_user_covered) || (ckpt_anchors() ?
+                            is_user_start && (n_tokens_start == first_user_pos || spaced) : n_tokens_start > 0 && spaced);
+                    const bool is_end_offset = (!ckpt_edges() && (n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
+                            (ubatch_offset && n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch)))) ||
+                            (think_end && n_tokens_start == n_prompt_all - 1);
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4450,7 +6852,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_anchor) {
                             do_checkpoint = false;
                         }
                     }
@@ -4467,11 +6869,10 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    // strixllama: at the anchors and the offsets before the end only - not at every batch that starts
+                    // within n_ubatch of the end, and not at turn starts closer to the last checkpoint than the spacing
+                    do_checkpoint = do_checkpoint && (is_anchor || is_end_offset ||
+                            (slot.prompt.checkpoints.empty() && near_prompt_end));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
@@ -4485,6 +6886,47 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+
+        // strixllama: nothing went into the step, three times in a row, because every busy conversation waits for cells
+        // (see pool_guard_on): the one that arrived last gives way - a prompt that holds cells, with an error a client
+        // may retry, else an answer, by ending as if its context were full. Its conversation stays in the slot, to go to
+        // disk or be purged like any idle one as the others need the room
+        if (pool_guard_on() && params_base.kv_unified) {
+            const bool stalled = batch.size() == 0 && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
+                return s.is_processing() && (s.pool_waiting || s.pool_paused);
+            });
+            n_pool_stalls = stalled ? n_pool_stalls + 1 : 0;
+            if (n_pool_stalls >= 3) {
+                n_pool_stalls = 0;
+                auto last_of = [&](const std::function<bool(const server_slot &)> & which) {
+                    server_slot * last = nullptr;
+                    for (auto & s : slots) {
+                        if (s.is_processing() && which(s) && (!last || s.task->id > last->task->id)) {
+                            last = &s;
+                        }
+                    }
+                    return last;
+                };
+                server_slot * prompt = last_of([](const server_slot & s) { return s.pool_waiting && s.prompt.n_tokens() > 0; });
+                server_slot * answer = prompt ? nullptr : last_of([](const server_slot & s) { return s.pool_paused; });
+                if (prompt == nullptr && answer == nullptr) {
+                    prompt = last_of([](const server_slot & s) { return s.pool_waiting; });
+                }
+                if (prompt != nullptr) {
+                    SLT_WRN(*prompt, "the KV pool (%u cells) is full and every busy conversation waits for room: this request gives way\n", llama_n_ctx(ctx_tgt));
+                    send_error(*prompt, "The KV cache is full with other conversations; try again shortly.", ERROR_TYPE_UNAVAILABLE);
+                    prompt->release();
+                } else if (answer != nullptr) {
+                    SLT_WRN(*answer, "the KV pool (%u cells) is full and every busy conversation waits for room: this answer ends here\n", llama_n_ctx(ctx_tgt));
+                    answer->truncated      = true;
+                    answer->stop           = STOP_TYPE_LIMIT;
+                    answer->has_next_token = false;
+                    answer->print_timings();
+                    send_final_response(*answer);
+                    answer->release();
+                }
+            }
         }
     }
 
@@ -4582,12 +7024,16 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool st = strixllama_spec_timing::enabled();
+        const int64_t t_dec0 = st ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
+            strixllama_fault("decode");
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (st) { g_spec_timing.decode += ggml_time_us() - t_dec0; g_spec_timing.n_batch_tokens += batch.view.size(); }
 
         if (ret != 0) {
             {
@@ -4647,9 +7093,11 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_proc0 = st ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            if (st) { g_spec_timing.process += ggml_time_us() - t_proc0; }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4688,6 +7136,7 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        strixllama_fault("post");
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4707,6 +7156,93 @@ private:
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
+
+        // strixllama: the generating slots of a step are sampled at once, one thread each (STRIX_PARALLEL_SAMPLING, on by
+        // default; 0: one after the other). A slot's sampler, its candidates and its random state are its own, and the
+        // logits are only read once the context has synchronized, so each slot samples the token it did before; what
+        // follows - accepting it, the text, the stop checks, the responses - still runs slot by slot in order. With eight
+        // conversations this was ~1.6 ms of every step, the GPU idle. A row the exact fast top-k takes (~60 us) is sampled
+        // in turn below: the threads of an eight-row step cost more than its rows (1.08 -> 0.58 ms)
+        std::vector<llama_token> pre_sampled(slots.size(), LLAMA_TOKEN_NULL);
+        const int64_t t_ps0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
+        {
+            // 2: also sample each slot again the old way from a copy of its sampler, taken first, and stop on a difference
+            static const int mode = getenv("STRIX_PARALLEL_SAMPLING") ? atoi(getenv("STRIX_PARALLEL_SAMPLING")) : 1;
+            const bool on = mode != 0;
+            std::vector<size_t> work;
+            if (on) {
+                for (size_t k = 0; k < slots.size(); ++k) {
+                    const server_slot & slot = slots[k];
+                    if (slot.state == SLOT_STATE_GENERATING && is_inside_view(slot.i_batch) && slot.task &&
+                            !(slot.can_speculate() && !slot.spec_draft.empty()) && !slot.task->params.sampling.backend_sampling &&
+                            !common_sampler_fast_applies(slot.smpl.get())) {
+                        work.push_back(k);
+                    }
+                }
+            }
+            if (work.size() >= 2) {
+                llama_synchronize(ctx_tgt);
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                std::vector<const float *> rows(work.size());
+                for (size_t w = 0; w < work.size(); ++w) {
+                    rows[w] = llama_get_logits_ith(slots[work[w]].ctx_tgt, slots[work[w]].i_batch - off);
+                }
+                bool ok = true;
+                for (const float * r : rows) {
+                    ok = ok && r != nullptr;
+                }
+                std::vector<common_sampler *> copies;
+                if (ok && mode == 2) {
+                    for (const size_t k : work) {
+                        copies.push_back(common_sampler_clone(slots[k].smpl.get()));
+                    }
+                }
+                if (ok) {
+                    scoped_timer timer(t_sampl, n_sampl);
+                    std::vector<std::thread> threads;
+                    threads.reserve(work.size() - 1);
+                    std::vector<std::exception_ptr> errors(work.size());
+                    auto run = [&](size_t w) {
+                        try {
+                            pre_sampled[work[w]] = common_sampler_sample_logits(slots[work[w]].smpl.get(), rows[w], n_vocab);
+                        } catch (...) {
+                            errors[w] = std::current_exception();
+                        }
+                    };
+                    for (size_t w = 1; w < work.size(); ++w) {
+                        threads.emplace_back(run, w);
+                    }
+                    run(0);
+                    for (auto & t : threads) {
+                        t.join();
+                    }
+                    // a slot whose sampling threw samples again the usual way below, where the error reaches iterate()
+                    for (size_t w = 0; w < work.size(); ++w) {
+                        if (errors[w]) {
+                            pre_sampled[work[w]] = LLAMA_TOKEN_NULL;
+                        }
+                    }
+                }
+                if (!copies.empty()) {
+                    static int64_t n_checked = 0;
+                    for (size_t w = 0; w < work.size(); ++w) {
+                        const server_slot & slot = slots[work[w]];
+                        const llama_token old_way = common_sampler_sample(copies[w], slot.ctx_tgt, slot.i_batch - off);
+                        common_sampler_free(copies[w]);
+                        if (pre_sampled[work[w]] != LLAMA_TOKEN_NULL && old_way != pre_sampled[work[w]]) {
+                            SRV_ERR("parallel sampling check: slot %d sampled %d, the old way %d\n", slot.id, pre_sampled[work[w]], old_way);
+                            GGML_ABORT("parallel sampling check failed");
+                        }
+                        ++n_checked;
+                    }
+                    if (n_checked % 512 < work.size()) {
+                        SRV_WRN("parallel sampling check: %lld tokens, the same as sampled one by one\n", (long long) n_checked);
+                    }
+                }
+            }
+        }
+
+        if (t_ps0) { g_spec_timing.sample += ggml_time_us() - t_ps0; }
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -4752,6 +7288,17 @@ private:
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
+
+                // strixllama: where the answer starts - the prompt's end, the drafter caught up on it - with the logits the
+                // first token is sampled from next, for a regenerate (see ckpt_edges)
+                const bool think = think_tail(slot.prompt.tokens, slot.prompt.n_tokens());
+                slot.n_prompt_end = slot.prompt.n_tokens() - (think ? 1 : 0);
+                if (ckpt_wanted(slot) && !think && checkpoint_here(slot)) {
+                    const float * lg = llama_get_logits_ith(ctx_tgt, slot.i_batch - off);
+                    if (lg != nullptr) {
+                        slot.prompt.checkpoints.back().logits.assign(lg, lg + llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
+                    }
+                }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -4763,8 +7310,8 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
+            llama_token id = pre_sampled[&slot - slots.data()];
+            if (id == LLAMA_TOKEN_NULL) {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
@@ -4829,9 +7376,15 @@ private:
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                const int64_t t_smp0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
+                // strixllama: a draft drawn from q (every token with its q) is verified by speculative sampling, as is a
+                // replay of one; a draft without q (another drafter's) by an exact match. Upstream's rejection sampling
+                // (use_spec_rejection) where ours is not on
+                const bool use_spec = synth_probs.empty() && slot.spec_sampling &&
+                    (slot.spec_is_replay || slot.spec_draft_q.size() >= slot.spec_draft.size());
 
                 // drafters that fill no distribution fall back here
-                const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+                const bool use_rejection = !slot.spec_sampling && slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
@@ -4839,15 +7392,31 @@ private:
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
-                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                } else if (use_spec) {
+                    accepted = common_sampler_sample_and_accept_n_spec(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
+                            slot.spec_draft_q, slot.spec_verify_rng, slot.spec_is_replay);
+                } else if (!slot.spec_sampling && slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
+                if (t_smp0) { g_spec_timing.sample += ggml_time_us() - t_smp0; }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // strixllama: a turn that ends at an accepted draft token (the end of turn drafted with what follows it,
+                // a newline, the next turn's start) drops the tokens after it as a rejected draft. Kept, they went into
+                // the slot's cache and memory, past the end of the answer, and the next request of the conversation -
+                // the answer, the end of turn, the next message - parted from the slot before the state it held: the
+                // whole answer was processed again from its checkpoint (326 of 810 tokens for a third chat turn)
+                for (size_t i = 0; i + 1 < accepted.size(); ++i) {
+                    if (llama_vocab_is_eog(vocab, accepted[i])) {
+                        accepted.resize(i + 1);
+                        break;
+                    }
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -4875,6 +7444,7 @@ private:
                         if (slot.ctx_dft) {
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
@@ -4899,6 +7469,9 @@ private:
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
+            }
+            if (!slot.spec_is_replay) {
+                note_spec_len(slot, n_accepted);
             }
             slot.spec_is_replay = false;
 
@@ -5130,7 +7703,7 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_video           */ impl->chat_params.allow_video,
         /* has_cap_chat            */ impl->has_cap_chat(),
         /* has_cap_tts             */ impl->has_cap_tts(),
-        /* has_audio_stream        */ impl->mtmd_cap.audio_stream,
+        /* has_audio_stream        */ impl->mctx != nullptr && mtmd_support_audio_stream(impl->mctx),
         /* json_ui_settings        */ impl->json_ui_settings,
         /* slot_n_ctx              */ impl->n_ctx_slot(),
         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
@@ -5203,6 +7776,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto & rd = res->rd;
     auto & params = this->params;
 
+    // strixllama: STRIX_REQUEST_LOG - the request as received and what the server derived from it, written with each
+    // task's result (server-queue.cpp); the rendered prompt is left out, it is the messages again
+    if (server_request_log_on()) {
+        rd.log_body   = req.body;
+        rd.log_server = data;
+        if (rd.log_server.is_object()) {
+            rd.log_server.erase("prompt");
+        }
+    }
+
     res->set_req(&req); // will also set spipe if needed
 
     if (!ctx_server.has_cap_chat()) {
@@ -5263,6 +7846,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && data.contains("strix_resp_tools") &&
+                    data.at("strix_resp_tools").is_object() && !data.at("strix_resp_tools").empty()) {
+                task.params.resp_tools = std::make_shared<const json>(data.at("strix_resp_tools"));
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -5602,6 +8189,46 @@ json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
 
+// strixllama: POST /strix/spec {"draft_max": n} - the draft length from the next step on, no reload (see g_strix_draft_cap)
+static std::unique_ptr<server_res_generator> strix_spec_response(std::unique_ptr<server_res_generator> res, const server_http_req & req) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception &) {
+        body = json::object();
+    }
+    if (!body.is_object() || !body.contains("draft_max") || !body.at("draft_max").is_number_integer()) {
+        res->error(format_error_response("draft_max (an integer) is required", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const int n = std::max(0, body.at("draft_max").get<int>());
+    g_strix_draft_cap.store(n, std::memory_order_relaxed);
+    SRV_INF("draft length set to %d\n", n);
+    res->ok({ { "draft_max", n } });
+    return res;
+}
+
+// strixllama: POST /strix/persist - see SERVER_TASK_TYPE_DISK_PERSIST
+static std::unique_ptr<server_res_generator> strix_persist_response(std::unique_ptr<server_res_generator> res, const server_http_req & req) {
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_DISK_PERSIST);
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    res->ok(result->to_json());
+    return res;
+}
+
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
@@ -5719,6 +8346,8 @@ void server_routes::init_routes() {
             }
         }
 
+        // strixllama: the requests waiting in the queue, beside the slots (the app's Logs page)
+        res->headers["X-Strix-Waiting"] = std::to_string(res_task->n_tasks_deferred);
         res->ok(res_task->to_json());
         return res;
     };
@@ -5949,6 +8578,9 @@ void server_routes::init_routes() {
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+        // strixllama: tools the model was not offered are named in a response header, so a client can tell
+        const json unsupported = json_value(body, "strix_resp_unsupported", json::array());
+        body.erase("strix_resp_unsupported");
         common_chat_session session;
         json body_parsed = oaicompat_chat_params_parse(
             ctx_server.vocab,
@@ -5956,13 +8588,21 @@ void server_routes::init_routes() {
             meta->chat_params,
             files,
             session);
-        return handle_completions_impl(
+        auto res_impl = handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_RESP,
             session);
+        if (unsupported.is_array() && !unsupported.empty()) {
+            std::string names;
+            for (const auto & n : unsupported) {
+                names += (names.empty() ? "" : ", ") + (n.is_string() ? n.get<std::string>() : n.dump());
+            }
+            res_impl->headers["X-Rulith-Unsupported-Tools"] = names;
+        }
+        return res_impl;
     };
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {
@@ -6137,13 +8777,16 @@ void server_routes::init_routes() {
                     if (!post_control(SERVER_CONTROL_ACTION_AUDIO_COMMIT, {})) {
                         break;
                     }
-                    // completed is sent once the rows of the committed audio are decoded (audio_commit_drained below)
+                    // the current item is the committed one, its transcript completes it and the next item opens
                     std::lock_guard<std::mutex> lock(mutex_item);
                     send_event(json {
                         {"type",             "input_audio_buffer.committed"},
                         {"previous_item_id", item_prev.empty() ? json(nullptr) : json(item_prev)},
                         {"item_id",          item_id},
                     });
+                    send_completed();
+                    item_prev = item_id;
+                    item_id   = "item_" + random_string();
                 } else if (type == "input_audio_buffer.clear") {
                     send_event(json {{"type", "input_audio_buffer.cleared"}});
                 } else {
@@ -6167,13 +8810,7 @@ void server_routes::init_routes() {
                 break;
             }
             if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get())) {
-                if (partial->audio_commit_drained) {
-                    // complete the committed item and open the next one
-                    std::lock_guard<std::mutex> lock(mutex_item);
-                    send_completed();
-                    item_prev = item_id;
-                    item_id   = "item_" + random_string();
-                } else if (!partial->content.text.empty()) {
+                if (!partial->content.text.empty()) {
                     std::lock_guard<std::mutex> lock(mutex_item);
                     item_text += partial->content.text;
                     send_event(json {
@@ -6627,6 +9264,14 @@ void server_routes::init_routes() {
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
+    };
+
+    this->post_strix_persist = [this](const server_http_req & req) {
+        return strix_persist_response(create_response(), req);
+    };
+
+    this->post_strix_spec = [this](const server_http_req & req) {
+        return strix_spec_response(create_response(), req);
     };
 }
 

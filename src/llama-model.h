@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-lazy-reader.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -235,6 +236,8 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head      = nullptr;
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
+    struct ggml_tensor * lr_proj               = nullptr; // strixllama: the draft's low-rank pre-score of the head
+    struct ggml_tensor * lr_scores             = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
 
     // qwen4exp: the MTP block collapses its hyper-connection streams with its own mixer
@@ -605,10 +608,6 @@ struct llama_layer {
     struct ggml_tensor * indexer_kpool_gate = nullptr;
     struct ggml_tensor * indexer_kpool_ape  = nullptr;
 
-    // deepseek41
-    struct ggml_tensor * engram_kv   = nullptr;
-    struct ggml_tensor * engram_gate = nullptr; // q_weight*k_weight folded
-
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
     struct ggml_tensor * index_k_proj = nullptr;
@@ -623,10 +622,6 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_down    = nullptr;
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
-    struct ggml_tensor * hc_attn_down_inject = nullptr; // [hc_attn_down | hc_attn_inject] in one weight
-    struct ggml_tensor * hc_ffn_down_inject  = nullptr; // [hc_ffn_down | hc_ffn_inject] in one weight
-    struct ggml_tensor * wqkv_z              = nullptr; // [wqkv | wqkv_gate] in one weight
-    struct ggml_tensor * ssm_beta_alpha_cat  = nullptr; // [ssm_beta | ssm_alpha] in one weight, unlike the grouped ssm_beta_alpha
 
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;
@@ -734,9 +729,6 @@ struct llama_model {
     std::vector<std::string> classifier_labels;
     std::vector<std::string> decision_labels;
 
-    // deepseek41 Engram: token id -> id of its normalized form, hashed into the n-grams
-    std::vector<int32_t> engram_token_map;
-
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
     struct ggml_tensor * pos_embd   = nullptr;
@@ -747,6 +739,9 @@ struct llama_model {
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+
+    // strixllama: the rot_in / rot_out of the EXL3 weights (llama-weight-aux.h)
+    llama_weight_aux_map waux;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
@@ -782,6 +777,7 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+    struct ggml_tensor * per_layer_tok_embd_b = nullptr; // strixllama: [head_dim, n_heads] of an EXL3 row codec table
 
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;
@@ -857,6 +853,18 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // strixllama: decode-precision twins of the Q8_0 trunk (LLAMA_TRUNK_DECODE_Q6K=1). Built once the
+    // weights are loaded, in their own device buffers; the originals are untouched, so prefill keeps
+    // its numerics. build_lora_mm swaps a weight for its twin on batches of at most
+    // llama_decode_twin_max_tokens() tokens (LLAMA_TRUNK_DECODE_MAX_T, default 8).
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> decode_twins;
+    void build_decode_twins();
+
+    // strixllama: BF16 twins of the F32 weights whose values are all bfloat16 (build_bf16_twins), used by batches of at
+    // most 8 tokens (llama_bf16_twin)
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    void build_bf16_twins();
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -886,7 +894,6 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
-    bool no_alloc() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -929,6 +936,12 @@ protected:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// strixllama: the decode twin of a trunk weight (null if none) and the batch bound under which it is used
+ggml_tensor * llama_decode_twin(const ggml_tensor * w);
+int64_t       llama_decode_twin_max_tokens();
+// strixllama: the BF16 twin of an F32 weight (null if none); used for batches of at most 8 tokens
+ggml_tensor * llama_bf16_twin(const ggml_tensor * w);
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);
@@ -991,6 +1004,14 @@ struct llama_model_base : public llama_model {
     void load_arch_hparams(llama_model_loader & ml) override = 0;
     void load_arch_tensors(llama_model_loader & ml) override = 0;
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
+
+    // --lazy-mode on-direct: read the rows of a lazy tensor with explicit
+    // pread()s instead of demand-faulting them in through the mmap. Call once
+    // per lazy tensor after creating it; returns null if the platform cannot
+    // serve direct reads (the tensor then stays on the lazy mmap path).
+    const llama_lazy_reader * load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t);
+
+    std::map<std::string, std::unique_ptr<llama_lazy_reader>> lazy_readers;
 };
 
 const char * llm_type_name(llm_type type);

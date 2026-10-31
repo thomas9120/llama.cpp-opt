@@ -31,8 +31,6 @@
 #define DIRECTORY_SEPARATOR '/'
 #endif // _WIN32
 
-#define COMMON_RECURSIVE_LIMIT 128
-
 #define COM_DBG(fmt, ...) LOG_DBG("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define COM_TRC(fmt, ...) LOG_TRC("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define COM_INF(fmt, ...) LOG_INF("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1297,6 +1295,11 @@ struct common_prompt_checkpoint {
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
+
+    // strixllama: (optional) the logits of the last token before the checkpoint - kept with the checkpoint taken where
+    // an answer starts, so that answer is sampled again from them without processing a token. Memory only: the disk
+    // tier does not store them
+    std::vector<float> logits;
 
     size_t size() const;
 

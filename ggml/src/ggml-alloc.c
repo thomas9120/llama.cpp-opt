@@ -429,6 +429,23 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        // strixllama: headroom for compute buffers. A graph a few MiB larger than the one reserved made gallocr free and
+        // reallocate the whole buffer (3.4 GiB for the qwen4exp target), and ROCm on Windows keeps a freed device buffer's
+        // commit in its cache, where a request a few MiB larger than it can never be served again: every such
+        // reallocation cost ~3.4 GiB of the machine's commit limit for the rest of the process. 3% + 16 MiB absorbs the
+        // growth measured between graphs; GGML_ALLOC_COMPUTE_PAD=0 turns it off.
+        if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && chunk_size > 0) {
+            static int pad_on = -1;
+            if (pad_on < 0) {
+                const char * e = getenv("GGML_ALLOC_COMPUTE_PAD");
+                pad_on = e == NULL || atoi(e) != 0;
+            }
+            if (pad_on) {
+                const size_t max_size = ggml_backend_buft_get_max_size(buft);
+                const size_t padded   = chunk_size + chunk_size/32 + ((size_t) 16 << 20);
+                chunk_size = padded <= max_size ? padded : (chunk_size > max_size ? chunk_size : max_size);
+            }
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -493,6 +510,9 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    struct ggml_hash_set pinned;
+    bool has_pinned;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -570,6 +590,9 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     }
 
     ggml_hash_set_free(&galloc->hash_set);
+    if (galloc->pinned.size > 0) {
+        ggml_hash_set_free(&galloc->pinned);
+    }
     free(galloc->hash_values);
     free(galloc->bufts);
     free(galloc->buffers);
@@ -588,6 +611,16 @@ static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct gg
 
 static bool ggml_gallocr_is_own(ggml_gallocr_t galloc, struct ggml_tensor * t) {
     return ggml_gallocr_hash_get(galloc, t)->allocated;
+}
+
+static bool ggml_gallocr_is_pinned(ggml_gallocr_t galloc, struct ggml_tensor * t) {
+    if (!galloc->has_pinned) {
+        return false;
+    }
+    while (t->view_src != NULL) {
+        t = t->view_src;
+    }
+    return ggml_hash_contains(&galloc->pinned, t);
 }
 
 static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor * t) {
@@ -642,6 +675,11 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     continue;
                 }
 
+                if (ggml_gallocr_is_pinned(galloc, parent)) {
+                    AT_PRINTF("not reusing parent %s for %s as it is pinned\n", parent->name, node->name);
+                    continue;
+                }
+
                 // outputs cannot be reused
                 if (parent->flags & GGML_TENSOR_FLAG_OUTPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                     AT_PRINTF("not reusing parent %s for %s as it is an output\n", parent->name, node->name);
@@ -688,10 +726,34 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
     }
 }
 
+void ggml_gallocr_pin_tensor(ggml_gallocr_t galloc, struct ggml_tensor * t) {
+    GGML_ASSERT(galloc);
+    if (galloc->pinned.size == 0) {
+        galloc->pinned = ggml_hash_set_new(GGML_DEFAULT_GRAPH_SIZE);
+    }
+    if (ggml_hash_insert(&galloc->pinned, t) == GGML_HASHSET_FULL) {
+        GGML_ABORT("%s: pinned tensor set is full\n", __func__);
+    }
+    galloc->has_pinned = true;
+}
+
+void ggml_gallocr_clear_pins(ggml_gallocr_t galloc) {
+    GGML_ASSERT(galloc);
+    if (galloc->pinned.size > 0) {
+        ggml_hash_set_reset(&galloc->pinned);
+    }
+    galloc->has_pinned = false;
+}
+
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);
+        return;
+    }
+
+    if (ggml_gallocr_is_pinned(galloc, node)) {
+        AT_PRINTF("not freeing pinned %s\n", node->name);
         return;
     }
 
@@ -923,6 +985,35 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            // strixllama: GGML_ALLOC_DEBUG=1 reports every compute buffer (re)allocation, also in release builds
+            {
+                static int dbg = -1;
+                if (dbg < 0) {
+                    const char * e = getenv("GGML_ALLOC_DEBUG");
+                    dbg = e != NULL && atoi(e) != 0;
+                }
+                if (dbg) {
+                    const size_t cur_size_dbg = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                    fprintf(stderr, "ggml-alloc: %s buffer %.2f -> %.2f MiB\n", ggml_backend_buft_name(galloc->bufts[i]),
+                            cur_size_dbg / 1048576.0, new_size / 1048576.0);
+                }
+            }
+            // strixllama: a buffer that grows again grows by a quarter at least. The padding in ggml_vbuffer_alloc (3% +
+            // 16 MiB) absorbs the jitter between graphs of one shape, but not a graph that keeps growing: once an image
+            // is in a conversation every ubatch takes the dense sparse-attention inputs, whose mask and bias grow with the
+            // cache, so the pinned host buffer that stages them was freed and allocated again for almost every image -
+            // and ROCm on Windows keeps each freed buffer, a few MiB too small for the next request, for the rest of the
+            // process. 27 images of 1920x1080 over a 58K conversation took 12 GiB of RAM that way, and the next large
+            // batch faulted (issue #2). Geometric growth makes those reallocations a handful per process.
+            if (galloc->buffers[i] != NULL) {
+                for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                    const size_t prev = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
+                    struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
+                    if (prev > 0 && chunk->max_size > prev && chunk->max_size < prev + prev/4) {
+                        chunk->max_size = prev + prev/4;
+                    }
+                }
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
